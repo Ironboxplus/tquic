@@ -32,7 +32,7 @@ use rand::Rng;
 
 use super::delivery_rate::DeliveryRateEstimator;
 use super::minmax::MinMax;
-use super::{CongestionController, CongestionStats};
+use super::{BandwidthMetrics, CongestionControlState, CongestionController, CongestionStats};
 use crate::connection::rtt::RttEstimator;
 use crate::connection::space::{RateSamplePacketState, SentPacket};
 use crate::RecoveryConfig;
@@ -1093,11 +1093,44 @@ impl CongestionController for Bbr {
             None => Some(self.pacing_rate),
         }
     }
+
+    fn bandwidth_metrics(&self) -> Option<BandwidthMetrics> {
+        Some(BandwidthMetrics {
+            btlbw: self.btlbw,
+            latest_delivery_rate: self.delivery_rate_estimator.delivery_rate(),
+            sample_app_limited: self.delivery_rate_estimator.is_sample_app_limited(),
+            sample_time: self.delivery_rate_estimator.sample_time(),
+            state: match self.state {
+                BbrStateMachine::Startup => CongestionControlState::Startup,
+                BbrStateMachine::Drain => CongestionControlState::Drain,
+                BbrStateMachine::ProbeBW => CongestionControlState::ProbeBandwidth,
+                BbrStateMachine::ProbeRTT => CongestionControlState::ProbeRtt,
+            },
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bbr_exposes_raw_bandwidth_metrics() {
+        let mut bbr = Bbr::new(BbrConfig::default());
+        bbr.btlbw = 1_000_000;
+        bbr.pacing_rate = 2_890_000;
+
+        let metrics = bbr
+            .bandwidth_metrics()
+            .expect("BBR must expose raw bandwidth metrics");
+
+        assert_eq!(metrics.btlbw, 1_000_000);
+        assert_eq!(metrics.latest_delivery_rate, 0);
+        assert!(!metrics.sample_app_limited);
+        assert_eq!(metrics.sample_time, None);
+        assert_eq!(metrics.state, CongestionControlState::Startup);
+        assert_ne!(metrics.btlbw, bbr.pacing_rate);
+    }
 
     #[test]
     fn bbr_ack() {

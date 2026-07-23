@@ -635,6 +635,12 @@ impl Config {
         self.multipath.multipath_algorithm = v;
     }
 
+    /// Set the SQM-weighted scheduler latency/bandwidth slider.
+    /// Values are clamped to `[0, 1]` and ignored by other schedulers.
+    pub fn set_multipath_sqm_lambda(&mut self, v: f64) {
+        self.multipath.sqm_lambda = v.clamp(0.0, 1.0);
+    }
+
     /// Set the maximum size of the connection flow control window.
     /// The default value is MAX_CONNECTION_WINDOW (15 MB).
     pub fn set_max_connection_window(&mut self, v: u64) {
@@ -893,12 +899,16 @@ impl Default for RecoveryConfig {
 pub struct MultipathConfig {
     /// Multipath scheduling algorithm.
     multipath_algorithm: MultipathAlgorithm,
+
+    /// SQM-weighted scheduler latency/bandwidth slider.
+    sqm_lambda: f64,
 }
 
 impl Default for MultipathConfig {
     fn default() -> MultipathConfig {
         MultipathConfig {
             multipath_algorithm: MultipathAlgorithm::MinRtt,
+            sqm_lambda: 1.0,
         }
     }
 }
@@ -1065,6 +1075,18 @@ pub enum PathEvent {
     Abandoned(usize),
 }
 
+/// High-level state of a model-based congestion controller.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionControlState {
+    #[default]
+    Unknown,
+    Startup,
+    Drain,
+    ProbeBandwidth,
+    ProbeRtt,
+}
+
 /// Statistics about path
 #[repr(C)]
 #[derive(Default)]
@@ -1138,6 +1160,35 @@ pub struct PathStats {
 
     /// Min pacing rate estimated by congestion control algorithm.
     pub min_pacing_rate: u64,
+
+    /// Whether model-based bandwidth metrics are available on this path.
+    pub bandwidth_model_valid: bool,
+
+    /// Raw bottleneck-bandwidth estimate in bytes per second.
+    pub btlbw: u64,
+
+    /// Most recent delivery-rate sample in bytes per second.
+    pub latest_delivery_rate: u64,
+
+    /// Whether the most recent delivery-rate sample was application limited.
+    pub delivery_rate_sample_app_limited: bool,
+
+    /// Whether a valid delivery-rate sample timestamp is available.
+    pub delivery_rate_sample_time_valid: bool,
+
+    /// Age of the most recent valid delivery-rate sample in microseconds.
+    pub delivery_rate_sample_age: u64,
+
+    /// Current high-level congestion-control state.
+    pub congestion_control_state: CongestionControlState,
+
+    /// Whether an external path optimizer has supplied a scheduler target.
+    pub scheduler_target_rate_valid: bool,
+
+    /// Externally optimized path send rate in bytes per second.
+    ///
+    /// A valid value of zero excludes the path from non-probing data scheduling.
+    pub scheduler_target_rate: u64,
 
     /// Record the total number of times the PTO is triggered on this path
     pub pto_count: u64,
@@ -1225,10 +1276,15 @@ mod tests {
 
 pub use crate::congestion_control::CongestionControlAlgorithm;
 pub use crate::connection::path::Path;
+pub use crate::connection::path::PathState;
 pub use crate::connection::Connection;
 pub use crate::endpoint::Endpoint;
 pub use crate::error::Error;
+pub use crate::multipath_scheduler::available_schedulers;
 pub use crate::multipath_scheduler::MultipathAlgorithm;
+pub use crate::multipath_scheduler::SchedulerInfo;
+pub use crate::multipath_scheduler::SchedulerTunable;
+pub use crate::multipath_scheduler::TunableKind;
 pub use crate::packet::PacketHeader;
 pub use crate::tls::CertCompressionAlgorithm;
 pub use crate::tls::TlsConfig;

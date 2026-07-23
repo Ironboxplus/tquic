@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use crate::connection::rtt::RttEstimator;
 use crate::connection::space::SentPacket;
+pub(crate) use crate::CongestionControlState;
 use crate::Error;
 use crate::RecoveryConfig;
 use crate::Result;
@@ -116,6 +117,27 @@ pub struct CongestionStats {
     pub bytes_lost_in_total: u64,
 }
 
+/// Algorithm-neutral bandwidth signals exposed by model-based congestion
+/// controllers. The scheduler must use the raw bottleneck estimate rather than
+/// a gain-adjusted pacing rate when these signals are available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BandwidthMetrics {
+    /// Windowed bottleneck-bandwidth estimate in bytes per second.
+    pub btlbw: u64,
+
+    /// Most recent delivery-rate sample in bytes per second.
+    pub latest_delivery_rate: u64,
+
+    /// Whether the most recent delivery-rate sample was application limited.
+    pub sample_app_limited: bool,
+
+    /// Wall-clock time associated with the most recent valid rate sample.
+    pub sample_time: Option<Instant>,
+
+    /// Current high-level congestion-control state.
+    pub state: CongestionControlState,
+}
+
 /// Congestion control interfaces shared by different algorithms.
 pub trait CongestionController {
     /// Name of congestion control algorithm.
@@ -179,6 +201,12 @@ pub trait CongestionController {
     fn stats(&self) -> &CongestionStats;
 
     fn min_pacing_rate(&self) -> Option<u64> {
+        None
+    }
+
+    /// Return raw model-based bandwidth signals when the congestion controller
+    /// maintains them. Window-based controllers keep the default `None`.
+    fn bandwidth_metrics(&self) -> Option<BandwidthMetrics> {
         None
     }
 }

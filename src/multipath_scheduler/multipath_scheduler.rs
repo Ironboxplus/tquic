@@ -20,6 +20,7 @@ use std::time::Instant;
 use self::scheduler_minrtt::*;
 use self::scheduler_redundant::*;
 use self::scheduler_rr::*;
+use self::scheduler_sqm::*;
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::space::SentPacket;
@@ -83,6 +84,13 @@ pub enum MultipathAlgorithm {
     /// distribution across all path is equal. It is only used for testing
     /// purposes.
     RoundRobin,
+
+    /// The scheduler spreads packets across all usable paths weighted by their
+    /// estimated capacity, exposing a single "latency <-> bandwidth" knob. At
+    /// one extreme it behaves like `MinRtt` (lowest latency, single best path);
+    /// at the other it stripes proportionally to per-path bandwidth (MPTCP-like
+    /// aggregation). See [`scheduler_sqm::SqmWeightedScheduler`].
+    SqmWeighted,
 }
 
 impl FromStr for MultipathAlgorithm {
@@ -95,6 +103,8 @@ impl FromStr for MultipathAlgorithm {
             Ok(MultipathAlgorithm::Redundant)
         } else if algor.eq_ignore_ascii_case("roundrobin") {
             Ok(MultipathAlgorithm::RoundRobin)
+        } else if algor.eq_ignore_ascii_case("sqmweighted") || algor.eq_ignore_ascii_case("sqm") {
+            Ok(MultipathAlgorithm::SqmWeighted)
         } else {
             Err(Error::InvalidConfig("unknown".into()))
         }
@@ -107,6 +117,7 @@ pub(crate) fn build_multipath_scheduler(conf: &MultipathConfig) -> Box<dyn Multi
         MultipathAlgorithm::MinRtt => Box::new(MinRttScheduler::new(conf)),
         MultipathAlgorithm::Redundant => Box::new(RedundantScheduler::new(conf)),
         MultipathAlgorithm::RoundRobin => Box::new(RoundRobinScheduler::new(conf)),
+        MultipathAlgorithm::SqmWeighted => Box::new(SqmWeightedScheduler::new(conf)),
     }
 }
 
@@ -115,7 +126,110 @@ pub(crate) fn buffer_required(algor: MultipathAlgorithm) -> bool {
         MultipathAlgorithm::MinRtt => false,
         MultipathAlgorithm::Redundant => true,
         MultipathAlgorithm::RoundRobin => false,
+        MultipathAlgorithm::SqmWeighted => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pluggable scheduler plugin metadata.
+//
+// The `MultipathScheduler` trait references engine-private types (`PathMap`,
+// `StreamMap`, ...), so schedulers must live inside this crate; a foreign crate
+// cannot implement one. The "plugin" surface is therefore selection-by-name
+// plus a tunables schema: a host (EasyTier, its GUI, or the FFI layer) can
+// enumerate the built-in schedulers, render each tunable automatically, and
+// pass the chosen algorithm name plus parameter values back through the config.
+// Adding a new algorithm means dropping a `scheduler_*.rs` module in this fork
+// and registering it in `SCHEDULER_REGISTRY` below.
+// ---------------------------------------------------------------------------
+
+/// Kind of a scheduler tunable, so a GUI/FFI can auto-render the right control.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TunableKind {
+    /// Continuous slider over `[min, max]` with the given `step`.
+    Slider { min: f64, max: f64, step: f64 },
+    /// Boolean toggle.
+    Bool,
+    /// Unsigned integer over `[min, max]`.
+    Uint { min: u64, max: u64 },
+}
+
+/// One tunable parameter of a scheduler plugin. Pure data (no engine types) so
+/// it can be re-exported to the GUI and the C FFI.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerTunable {
+    /// Stable machine key, used in config/params.
+    pub key: &'static str,
+    /// Human-facing label for the control.
+    pub label: &'static str,
+    /// Control kind + range.
+    pub kind: TunableKind,
+    /// Default value (for `Bool`, `0.0` = false, `1.0` = true).
+    pub default: f64,
+    /// One-line help/tooltip.
+    pub help: &'static str,
+}
+
+/// Metadata describing an available multipath scheduler plugin.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerInfo {
+    /// Stable machine name accepted by [`MultipathAlgorithm::from_str`].
+    pub name: &'static str,
+    /// Human-facing description.
+    pub description: &'static str,
+    /// Whether the scheduler needs the reorder/redundancy send buffer.
+    pub buffer_required: bool,
+    /// Tunable parameters exposed to the host UI.
+    pub tunables: &'static [SchedulerTunable],
+}
+
+/// Tunables for [`MultipathAlgorithm::SqmWeighted`].
+static SQM_TUNABLES: &[SchedulerTunable] = &[SchedulerTunable {
+    key: "lambda",
+    label: "Latency \u{2194} Bandwidth",
+    kind: TunableKind::Slider {
+        min: 0.0,
+        max: 1.0,
+        step: 0.01,
+    },
+    default: scheduler_sqm::DEFAULT_LAMBDA,
+    help: "0 = lowest latency (single best path); 1 = maximum bandwidth (weighted striping across all paths).",
+}];
+
+/// All built-in scheduler plugins, in display order.
+static SCHEDULER_REGISTRY: &[SchedulerInfo] = &[
+    SchedulerInfo {
+        name: "minrtt",
+        description: "Lowest smoothed-RTT path first; spills to the next path when its cwnd fills.",
+        buffer_required: false,
+        tunables: &[],
+    },
+    SchedulerInfo {
+        name: "sqmweighted",
+        description: "Capacity-weighted striping with a latency<->bandwidth slider (bandwidth aggregation).",
+        buffer_required: false,
+        tunables: SQM_TUNABLES,
+    },
+    SchedulerInfo {
+        name: "redundant",
+        description: "Send every packet on all paths; trades bandwidth for the lowest possible latency.",
+        buffer_required: true,
+        tunables: &[],
+    },
+    SchedulerInfo {
+        name: "roundrobin",
+        description: "Equal round-robin across paths (testing only).",
+        buffer_required: false,
+        tunables: &[],
+    },
+];
+
+/// Enumerate all built-in scheduler plugins and their tunables.
+///
+/// Hosts (EasyTier / its GUI / the FFI) use this to render per-scheduler
+/// configuration UI automatically instead of hard-coding option lists.
+pub fn available_schedulers() -> &'static [SchedulerInfo] {
+    SCHEDULER_REGISTRY
 }
 
 #[cfg(test)]
@@ -196,6 +310,9 @@ pub(crate) mod tests {
             ("Roundrobin", Ok(MultipathAlgorithm::RoundRobin)),
             ("RoundRobin", Ok(MultipathAlgorithm::RoundRobin)),
             ("ROUNDROBIN", Ok(MultipathAlgorithm::RoundRobin)),
+            ("sqmweighted", Ok(MultipathAlgorithm::SqmWeighted)),
+            ("SqmWeighted", Ok(MultipathAlgorithm::SqmWeighted)),
+            ("SQM", Ok(MultipathAlgorithm::SqmWeighted)),
             ("redun", Err(Error::InvalidConfig("unknown".into()))),
         ];
 
@@ -208,3 +325,4 @@ pub(crate) mod tests {
 mod scheduler_minrtt;
 mod scheduler_redundant;
 mod scheduler_rr;
+mod scheduler_sqm;

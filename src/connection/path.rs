@@ -65,6 +65,14 @@ pub struct Path {
     /// path is active and the others are not active.
     active: bool,
 
+    /// Optional send-rate target supplied by an external path optimizer.
+    ///
+    /// `None` keeps the scheduler's native BBR/RTT weighting. `Some(0)` keeps
+    /// the path available for validation and recovery traffic but excludes it
+    /// from non-probing data scheduling. A positive value is authoritative and
+    /// must not be reweighted by the scheduler's latency/bandwidth knob.
+    scheduler_target_rate: Option<u64>,
+
     /// Loss recovery and congestion control.
     pub(crate) recovery: Recovery,
 
@@ -139,6 +147,7 @@ impl Path {
             dcid_seq,
             peer_context: None,
             active: false,
+            scheduler_target_rate: None,
             recovery: Recovery::new(conf),
             state,
             recv_chals: VecDeque::new(),
@@ -342,6 +351,28 @@ impl Path {
         self.active = v;
     }
 
+    /// Set the externally optimized send-rate target for this path.
+    pub(crate) fn set_scheduler_target_rate(&mut self, rate: Option<u64>) {
+        self.scheduler_target_rate = rate;
+        if rate == Some(0) {
+            self.active = false;
+        } else if self.validated() && !self.is_abandon {
+            self.active = true;
+        }
+    }
+
+    /// Return the externally optimized send-rate target for this path.
+    pub(crate) fn scheduler_target_rate(&self) -> Option<u64> {
+        self.scheduler_target_rate
+    }
+
+    /// Mark this path as abandoned by the host.
+    pub(crate) fn abandon(&mut self) {
+        self.is_abandon = true;
+        self.active = false;
+        self.scheduler_target_rate = Some(0);
+    }
+
     /// Return whether the path is unused.
     fn unused(&self) -> bool {
         !self.active && self.dcid_seq.is_none()
@@ -350,6 +381,8 @@ impl Path {
     /// Update and return the latest statistics about the path
     pub fn stats(&mut self) -> &PathStats {
         self.recovery.stat_lazy_update();
+        self.recovery.stats.scheduler_target_rate_valid = self.scheduler_target_rate.is_some();
+        self.recovery.stats.scheduler_target_rate = self.scheduler_target_rate.unwrap_or_default();
         &self.recovery.stats
     }
 
@@ -738,6 +771,23 @@ mod tests {
         assert_eq!(path_mgr.get(pid)?.unused(), false);
         assert_eq!(path_mgr.get_mut(pid)?.stats().recv_count, 0);
         assert_eq!(path_mgr.get_mut(pid)?.stats().sent_count, 0);
+        assert!(path_mgr.get_mut(pid)?.stats().bandwidth_model_valid);
+        assert_eq!(
+            path_mgr.get_mut(pid)?.stats().congestion_control_state,
+            crate::CongestionControlState::Startup
+        );
+        assert!(!path_mgr.get_mut(pid)?.stats().scheduler_target_rate_valid);
+        path_mgr
+            .get_mut(pid)?
+            .set_scheduler_target_rate(Some(3_000_000));
+        assert!(path_mgr.get_mut(pid)?.stats().scheduler_target_rate_valid);
+        assert_eq!(
+            path_mgr.get_mut(pid)?.stats().scheduler_target_rate,
+            3_000_000
+        );
+        path_mgr.get_mut(pid)?.set_scheduler_target_rate(None);
+        assert!(!path_mgr.get_mut(pid)?.stats().scheduler_target_rate_valid);
+        assert_eq!(path_mgr.get_mut(pid)?.stats().scheduler_target_rate, 0);
         assert_eq!(path_mgr.get_active()?.local_addr(), client_addr);
         assert_eq!(path_mgr.get_active_mut()?.remote_addr(), server_addr);
         assert_eq!(path_mgr.get_active_path_id()?, 0);
@@ -804,6 +854,50 @@ mod tests {
         assert_eq!(path_mgr.get_mut(pid)?.sent_chals.len(), 0);
         assert_eq!(path_mgr.get_mut(pid)?.state, PathState::Validated);
 
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_path_is_immediately_removed_from_data_scheduling() -> Result<()> {
+        let client_addrs = vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            9450,
+        )];
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 450);
+        let mut path_mgr = new_path_mgr(&client_addrs, server_addr, 8, false)?;
+        let path = path_mgr.get_mut(0)?;
+        path.set_scheduler_target_rate(Some(50_000_000));
+
+        path.abandon();
+
+        assert!(path.is_abandon);
+        assert!(
+            !path.active(),
+            "abandoned path must stop carrying payload immediately"
+        );
+        assert_eq!(
+            path.scheduler_target_rate(),
+            Some(0),
+            "abandoned path must not retain scheduler credit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_target_deactivates_path_and_positive_target_reactivates_validated_path() -> Result<()> {
+        let client_addrs = vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            9451,
+        )];
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 451);
+        let mut path_mgr = new_path_mgr(&client_addrs, server_addr, 8, false)?;
+        let path = path_mgr.get_mut(0)?;
+
+        path.set_scheduler_target_rate(Some(0));
+        assert!(!path.active());
+
+        path.set_scheduler_target_rate(Some(10_000_000));
+        assert!(path.active());
         Ok(())
     }
 

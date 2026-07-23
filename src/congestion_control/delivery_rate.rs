@@ -89,6 +89,9 @@ pub struct DeliveryRateEstimator {
 
     /// Rate sample.
     rate_sample: RateSample,
+
+    /// Wall-clock time associated with the most recent valid rate sample.
+    rate_sample_time: Option<Instant>,
 }
 
 impl DeliveryRateEstimator {
@@ -201,6 +204,7 @@ impl DeliveryRateEstimator {
 
         self.rate_sample.delivery_rate = self.rate_sample.delivered * 1_000_000_u64
             / self.rate_sample.interval.as_micros() as u64;
+        self.rate_sample_time = Some(self.delivered_time);
     }
 
     /// Set app limited status and record the latest packet num as end of app limited mode.
@@ -247,6 +251,11 @@ impl DeliveryRateEstimator {
     pub fn is_sample_app_limited(&self) -> bool {
         self.rate_sample.is_app_limited
     }
+
+    /// Wall-clock time associated with the most recent valid rate sample.
+    pub fn sample_time(&self) -> Option<Instant> {
+        self.rate_sample_time
+    }
 }
 
 impl Default for DeliveryRateEstimator {
@@ -260,6 +269,7 @@ impl Default for DeliveryRateEstimator {
             largest_acked_pkt_num: 0,
             last_sent_pkt_num: 0,
             rate_sample: RateSample::default(),
+            rate_sample_time: None,
         }
     }
 }
@@ -343,6 +353,7 @@ mod tests {
         rate_estimator.rate_sample.prior_delivered = 1200;
         rate_estimator.rate_sample.prior_time = Some(Instant::now());
         rate_estimator.delivered = 7200;
+        let sample_time = rate_estimator.delivered_time;
 
         rate_estimator.generate_rate_sample();
         assert_eq!(
@@ -353,6 +364,7 @@ mod tests {
         assert_eq!(rate_estimator.sample_delivered(), 6000);
         assert_eq!(rate_estimator.sample_prior_delivered(), 1200);
         assert_eq!(rate_estimator.delivery_rate(), 6_000_000 / 25);
+        assert_eq!(rate_estimator.sample_time(), Some(sample_time));
     }
 
     #[test]

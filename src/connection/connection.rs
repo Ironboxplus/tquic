@@ -3785,7 +3785,7 @@ impl Connection {
 
         // Mark the path as abandoned.
         let path = self.paths.get_mut(pid)?;
-        path.is_abandon = true;
+        path.abandon();
         Ok(())
     }
 
@@ -3818,6 +3818,44 @@ impl Connection {
             .get_path_id(&(local_addr, remote_addr))
             .ok_or(Error::InvalidOperation("not found".into()))?;
         Ok(self.paths.get_mut(pid)?.stats())
+    }
+
+    /// Set or clear the externally optimized send-rate target for a path.
+    ///
+    /// `None` restores the scheduler's native congestion-control/RTT policy.
+    /// `Some(0)` excludes the path from non-probing data scheduling while
+    /// leaving it available for path validation and recovery traffic.
+    pub fn set_path_target_rate(
+        &mut self,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        rate: Option<u64>,
+    ) -> Result<()> {
+        let pid = self
+            .paths
+            .get_path_id(&(local_addr, remote_addr))
+            .ok_or(Error::InvalidOperation("not found".into()))?;
+        self.paths.get_mut(pid)?.set_scheduler_target_rate(rate);
+        self.mark_tickable(true);
+        Ok(())
+    }
+
+    /// Replace the live multipath packet scheduler without rebuilding the
+    /// connection. Existing path validation, recovery and congestion-control
+    /// state are preserved.
+    pub fn set_multipath_scheduler(
+        &mut self,
+        algorithm: MultipathAlgorithm,
+        sqm_lambda: f64,
+    ) -> Result<()> {
+        if !self.flags.contains(EnableMultipath) {
+            return Err(Error::InvalidOperation("multipath is disabled".into()));
+        }
+        self.multipath_conf.multipath_algorithm = algorithm;
+        self.multipath_conf.sqm_lambda = sqm_lambda.clamp(0.0, 1.0);
+        self.multipath_scheduler = Some(build_multipath_scheduler(&self.multipath_conf));
+        self.mark_tickable(true);
+        Ok(())
     }
 
     /// Migrates the connection to the specified path.

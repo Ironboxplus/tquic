@@ -35,7 +35,7 @@ use rand::Rng;
 
 use super::delivery_rate::DeliveryRateEstimator;
 use super::minmax::MinMax;
-use super::{CongestionController, CongestionStats};
+use super::{BandwidthMetrics, CongestionControlState, CongestionController, CongestionStats};
 use crate::connection::rtt::RttEstimator;
 use crate::connection::space::{RateSamplePacketState, SentPacket};
 use crate::RecoveryConfig;
@@ -1975,11 +1975,47 @@ impl CongestionController for Bbr3 {
             None => Some(self.pacing_rate),
         }
     }
+
+    fn bandwidth_metrics(&self) -> Option<BandwidthMetrics> {
+        Some(BandwidthMetrics {
+            btlbw: self.max_bw,
+            latest_delivery_rate: self.delivery_rate_estimator.delivery_rate(),
+            sample_app_limited: self.delivery_rate_estimator.is_sample_app_limited(),
+            sample_time: self.delivery_rate_estimator.sample_time(),
+            state: match self.state {
+                State::Startup => CongestionControlState::Startup,
+                State::Drain => CongestionControlState::Drain,
+                State::ProbeBwDown
+                | State::ProbeBwCruise
+                | State::ProbeBwRefill
+                | State::ProbeBwUp => CongestionControlState::ProbeBandwidth,
+                State::ProbeRTT => CongestionControlState::ProbeRtt,
+            },
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bbr3_exposes_raw_bandwidth_metrics() {
+        let mut bbr3 = Bbr3::new(Bbr3Config::default());
+        bbr3.max_bw = 1_000_000;
+        bbr3.pacing_rate = 2_770_000;
+
+        let metrics = bbr3
+            .bandwidth_metrics()
+            .expect("BBRv3 must expose raw bandwidth metrics");
+
+        assert_eq!(metrics.btlbw, 1_000_000);
+        assert_eq!(metrics.latest_delivery_rate, 0);
+        assert!(!metrics.sample_app_limited);
+        assert_eq!(metrics.sample_time, None);
+        assert_eq!(metrics.state, CongestionControlState::Startup);
+        assert_ne!(metrics.btlbw, bbr3.pacing_rate);
+    }
 
     #[test]
     fn bbr3_ack() {

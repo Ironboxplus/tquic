@@ -969,6 +969,37 @@ impl Recovery {
         self.stats.in_slow_start = self.congestion.in_slow_start();
         self.stats.pacing_rate = self.congestion.pacing_rate().unwrap_or_default();
         self.stats.min_pacing_rate = self.congestion.min_pacing_rate().unwrap_or_default();
+        match self.congestion.bandwidth_metrics() {
+            Some(metrics) => {
+                self.stats.bandwidth_model_valid = true;
+                self.stats.btlbw = metrics.btlbw;
+                self.stats.latest_delivery_rate = metrics.latest_delivery_rate;
+                self.stats.delivery_rate_sample_app_limited = metrics.sample_app_limited;
+                self.stats.congestion_control_state = metrics.state;
+                match metrics.sample_time {
+                    Some(sample_time) => {
+                        self.stats.delivery_rate_sample_time_valid = true;
+                        self.stats.delivery_rate_sample_age = Instant::now()
+                            .saturating_duration_since(sample_time)
+                            .as_micros()
+                            as u64;
+                    }
+                    None => {
+                        self.stats.delivery_rate_sample_time_valid = false;
+                        self.stats.delivery_rate_sample_age = 0;
+                    }
+                }
+            }
+            None => {
+                self.stats.bandwidth_model_valid = false;
+                self.stats.btlbw = 0;
+                self.stats.latest_delivery_rate = 0;
+                self.stats.delivery_rate_sample_app_limited = false;
+                self.stats.delivery_rate_sample_time_valid = false;
+                self.stats.delivery_rate_sample_age = 0;
+                self.stats.congestion_control_state = crate::CongestionControlState::Unknown;
+            }
+        }
         self.stats.pto_count = self.pto_count as u64;
     }
 
