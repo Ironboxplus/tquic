@@ -69,6 +69,7 @@ fn new_boringssl_cmake_config() -> cmake::Config {
     let target = std::env::var("TARGET").unwrap();
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap();
 
     let mut boringssl_cmake = cmake::Config::new("deps/boringssl");
 
@@ -129,6 +130,14 @@ fn new_boringssl_cmake_config() -> cmake::Config {
                 boringssl_cmake.define("CMAKE_C_FLAGS", "-Wno-unused-command-line-argument");
                 boringssl_cmake.define("CMAKE_CXX_FLAGS", "-Wno-unused-command-line-argument");
             }
+        }
+
+        // BoringSSL does not support its x86/x86_64 assembly sources with the
+        // MinGW toolchain. Without this switch the C sources select ADX
+        // routines which are never linked, leaving unresolved `fiat_*_adx_*`
+        // symbols when Rust builds a Windows GNU DLL.
+        "windows" if target_env == "gnu" => {
+            boringssl_cmake.define("OPENSSL_NO_ASM", "1");
         }
 
         _ => (),
