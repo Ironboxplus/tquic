@@ -2047,6 +2047,9 @@ impl From<&PacketInfo<'_>> for crate::PacketInfo {
             src: sock_addr_from_c(info.src, info.src_len),
             dst: sock_addr_from_c(info.dst, info.dst_len),
             time: Instant::now(),
+            // The C ABI predates composition metadata. Incoming packets have
+            // no send-side semantics; outbound Rust composition fills it.
+            send_meta: crate::PacketSendMeta::default(),
         }
     }
 }

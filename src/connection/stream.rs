@@ -2491,7 +2491,7 @@ impl SendBuf {
     /// for that transmission.
     ///
     /// Return the range of bytes to transmit.
-    fn poll_transmit(&mut self, max_len: usize) -> Range<u64> {
+    fn poll_transmit_with_retransmission(&mut self, max_len: usize) -> (Range<u64>, bool) {
         // 1. Check and Retransmit sent data
         if let Some(range) = self.retransmits.pop_min() {
             let end = cmp::min(range.end, range.start.saturating_add(max_len as u64));
@@ -2501,7 +2501,7 @@ impl SendBuf {
 
             let rtx_range = range.start..end;
             trace!("{} poll_transmit, rtx range {:?}", self.trace_id, rtx_range);
-            return rtx_range;
+            return (rtx_range, true);
         }
 
         // 2. Transmit new data
@@ -2513,7 +2513,13 @@ impl SendBuf {
         let new_range = self.unsent_off..end;
         trace!("{} poll_transmit, new range {:?}", self.trace_id, new_range);
         self.unsent_off = end;
-        new_range
+        (new_range, false)
+    }
+
+    /// Compute the next range to transmit. Kept as the plain range helper for
+    /// callers/tests that do not need to report the source of the bytes.
+    fn poll_transmit(&mut self, max_len: usize) -> Range<u64> {
+        self.poll_transmit_with_retransmission(max_len).0
     }
 
     /// Read the range-associated interval data, which may actually be a subset of
@@ -2541,9 +2547,10 @@ impl SendBuf {
 
     /// Read data from the send buffer, and write them into the given output buffer.
     /// Return output buffer length and fin flag.
-    pub fn read(&mut self, out: &mut [u8]) -> Result<(usize, bool)> {
+    pub fn read_with_retransmission(&mut self, out: &mut [u8]) -> Result<(usize, bool, bool)> {
         let mut len = 0;
         let mut cap = out.len();
+        let mut retransmission = false;
         let out_off = self.send_off();
         // The caller of this function has already written the offset of the STREAM frame
         // into the header of the frame, so we must keep it consistent here.
@@ -2554,7 +2561,8 @@ impl SendBuf {
             && self.send_off() == next_off
             && self.send_off() < self.max_data
         {
-            let range = self.poll_transmit(cap);
+            let (range, retransmitted_range) = self.poll_transmit_with_retransmission(cap);
+            retransmission |= retransmitted_range;
             // The data specified by the range may not be stored contiguously, so it
             // may not be retrieved by a single `read_range` call, so here we need to loop
             // until the range is completely copied into the given out buffer.
@@ -2581,7 +2589,13 @@ impl SendBuf {
         // is not ready, but the fin flag will be read out.
         let fin = self.fin_off == Some(next_off);
 
-        Ok((out.len() - cap, fin))
+        Ok((out.len() - cap, fin, retransmission))
+    }
+
+    /// Read data while preserving the historical public return type.
+    pub fn read(&mut self, out: &mut [u8]) -> Result<(usize, bool)> {
+        let (len, fin, _) = self.read_with_retransmission(out)?;
+        Ok((len, fin))
     }
 
     /// Return true if there is data to be sent.
@@ -7128,6 +7142,29 @@ mod tests {
         assert_eq!(send.poll_transmit(2), Range { start: 14, end: 16 });
         // send [16, 18)
         assert_eq!(send.poll_transmit(10), Range { start: 16, end: 18 });
+    }
+
+    #[test]
+    fn send_buf_read_reports_only_loss_recovery_bytes_as_retransmissions() {
+        let mut send = SendBuf::new(100);
+        assert_eq!(send.write(Bytes::from_static(b"retransmit"), false), Ok(10));
+
+        let mut buf = [0; 4];
+        assert_eq!(
+            send.read_with_retransmission(&mut buf),
+            Ok((4, false, false)),
+            "first transmission must not be labelled as a retransmission"
+        );
+        assert_eq!(&buf, b"retr");
+
+        send.retransmit(0, 4);
+        buf.fill(0);
+        assert_eq!(
+            send.read_with_retransmission(&mut buf),
+            Ok((4, false, true)),
+            "only a range selected from loss recovery carries retransmission metadata"
+        );
+        assert_eq!(&buf, b"retr");
     }
 
     // Test SendBuf::shutdown

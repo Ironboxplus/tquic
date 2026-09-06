@@ -262,6 +262,38 @@ pub struct PacketInfo {
 
     /// The time when the packet arrived or the time to send the packet
     pub time: time::Instant,
+
+    /// Semantics captured while the packet was composed, before encryption.
+    /// Send backends must use this rather than attempting to inspect encrypted
+    /// QUIC payloads to decide whether a packet may consume a data budget.
+    pub send_meta: PacketSendMeta,
+}
+
+/// Stable send-side classification supplied by TQUIC packet composition.
+/// A packet can be mixed: e.g. ACK plus STREAM is both control and data.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PacketSendMeta {
+    /// Application STREAM bytes. CRYPTO bytes intentionally do not set this:
+    /// they are handshake control and must retain liveness credit while the
+    /// application-data budget is explicitly paused.
+    pub contains_data: bool,
+    pub contains_ack: bool,
+    pub contains_probe: bool,
+    pub contains_path_validation: bool,
+    pub contains_handshake: bool,
+    pub contains_close: bool,
+    /// At least one STREAM or CRYPTO byte in this packet came from a range
+    /// declared lost by QUIC recovery. Multipath duplicate/buffered copies do
+    /// not set this flag merely because they were queued internally.
+    pub contains_retransmission: bool,
+}
+
+impl PacketSendMeta {
+    /// Control and recovery packets must retain liveness credit when a data
+    /// ceiling is paused. A mixed packet still consumes data credit.
+    pub const fn is_control_only(self) -> bool {
+        !self.contains_data
+    }
 }
 
 /// Address tuple.

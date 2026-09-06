@@ -73,6 +73,7 @@ use crate::FourTuple;
 use crate::FourTupleIter;
 use crate::MultipathConfig;
 use crate::PacketInfo;
+use crate::PacketSendMeta;
 use crate::PathEvent;
 use crate::PathStats;
 use crate::RecoveryConfig;
@@ -1577,16 +1578,25 @@ impl Connection {
         left = self.paths.cmp_anti_ampl_limit(pid, left);
 
         let mut done = 0;
+        let mut send_meta = PacketSendMeta::default();
 
         // Write QUIC packets to the buffer
         let mut has_initial = false;
         while left > 0 {
-            let (pkt_type, is_pmtu_probe, written) =
+            let (pkt_type, is_pmtu_probe, written, packet_meta) =
                 match self.send_packet(&mut out[done..], left, pid, done == 0, has_initial) {
                     Ok(v) => v,
                     Err(Error::BufferTooShort) | Err(Error::Done) => break,
                     Err(e) => return Err(e),
                 };
+
+            send_meta.contains_data |= packet_meta.contains_data;
+            send_meta.contains_ack |= packet_meta.contains_ack;
+            send_meta.contains_probe |= packet_meta.contains_probe;
+            send_meta.contains_path_validation |= packet_meta.contains_path_validation;
+            send_meta.contains_handshake |= packet_meta.contains_handshake;
+            send_meta.contains_close |= packet_meta.contains_close;
+            send_meta.contains_retransmission |= packet_meta.contains_retransmission;
 
             left = left.saturating_sub(written);
             done = done.saturating_add(written);
@@ -1629,6 +1639,7 @@ impl Connection {
             src: path.local_addr(),
             dst: path.remote_addr(),
             time: time::Instant::now(),
+            send_meta,
         };
         Ok((done, info))
     }
@@ -1657,7 +1668,7 @@ impl Connection {
         path_id: usize,
         first: bool,
         has_initial: bool,
-    ) -> Result<(PacketType, bool, usize)> {
+    ) -> Result<(PacketType, bool, usize, PacketSendMeta)> {
         let now = time::Instant::now();
 
         if out.len() < left {
@@ -1811,6 +1822,12 @@ impl Connection {
             payload_offset + payload_len
         };
 
+        let send_meta = Self::packet_send_meta(
+            &write_status.frames,
+            pkt_type,
+            write_status.is_probe,
+            write_status.contains_retransmission,
+        );
         let sent_pkt = space::SentPacket {
             pkt_type,
             pkt_num,
@@ -1928,7 +1945,7 @@ impl Connection {
             self.flags.insert(SentAckElicitingSinceRecvPkt);
         }
 
-        Ok((pkt_type, write_status.is_pmtu_probe, written))
+        Ok((pkt_type, write_status.is_pmtu_probe, written, send_meta))
     }
 
     /// Write QUIC frames to the payload of a QUIC packet.
@@ -2511,7 +2528,9 @@ impl Connection {
             return Ok(());
         }
 
-        let (frame_data_len, _) = stream.send.read(&mut out[frame_hdr_len..])?;
+        let (frame_data_len, _, retransmission) = stream
+            .send
+            .read_with_retransmission(&mut out[frame_hdr_len..])?;
         frame::encode_crypto_header(crypto_off, frame_data_len as u64, out)?;
         st.written += frame_hdr_len + frame_data_len;
         st.frames.push(Frame::Crypto {
@@ -2522,6 +2541,7 @@ impl Connection {
         st.ack_eliciting = true;
         st.in_flight = true;
         st.has_data = true;
+        st.contains_retransmission |= retransmission;
 
         Ok(())
     }
@@ -2569,7 +2589,9 @@ impl Connection {
             let frame_hdr_len = frame::stream_header_wire_len(stream_id, stream_off);
 
             // Read stream data and write into the packet buffer directly.
-            let (frame_data_len, fin) = stream.send.read(&mut out[len + frame_hdr_len..])?;
+            let (frame_data_len, fin, retransmission) = stream
+                .send
+                .read_with_retransmission(&mut out[len + frame_hdr_len..])?;
 
             // Retain stream data if needed.
             let data = if self.flags.contains(EnableMultipath)
@@ -2597,6 +2619,7 @@ impl Connection {
             st.ack_eliciting = true;
             st.in_flight = true;
             st.has_data = true;
+            st.contains_retransmission |= retransmission;
             st.frames.push(Frame::Stream {
                 stream_id,
                 offset: stream_off,
@@ -2793,6 +2816,43 @@ impl Connection {
         st.written += frame.to_bytes(&mut out[st.written..])?;
         st.frames.push(frame);
         Ok(())
+    }
+
+    /// Convert the frame list produced before encryption into the stable metadata
+    /// exposed to the socket backend. This is deliberately adjacent to packet
+    /// composition: downstream code must never infer control semantics from
+    /// encrypted wire bytes.
+    fn packet_send_meta(
+        frames: &[Frame],
+        pkt_type: PacketType,
+        is_probe: bool,
+        contains_retransmission: bool,
+    ) -> PacketSendMeta {
+        let mut meta = PacketSendMeta {
+            contains_handshake: pkt_type != PacketType::OneRTT,
+            contains_probe: is_probe,
+            contains_retransmission,
+            ..PacketSendMeta::default()
+        };
+        for frame in frames {
+            match frame {
+                // Only application STREAM bytes consume the data allowance. QUIC
+                // CRYPTO frames carry handshake state and must remain eligible for
+                // the bounded control reserve while application data is paused.
+                Frame::Stream { .. } => meta.contains_data = true,
+                Frame::Crypto { .. } | Frame::HandshakeDone => meta.contains_handshake = true,
+                Frame::Ack { .. } => meta.contains_ack = true,
+                Frame::PathChallenge { .. } | Frame::PathResponse { .. } => {
+                    meta.contains_path_validation = true
+                }
+                Frame::ConnectionClose { .. } | Frame::ApplicationClose { .. } => {
+                    meta.contains_close = true
+                }
+                Frame::Ping { pmtu_probe } => meta.contains_probe |= pmtu_probe.is_some(),
+                _ => {}
+            }
+        }
+        meta
     }
 
     /// Check whether a HANDHSAKE_DONE frame should be sent.
@@ -4572,6 +4632,12 @@ struct FrameWriteStatus {
 
     /// Status about buffered frames written to the packet.
     buffer_flags: BufferFlags,
+
+    /// Whether a STREAM/CRYPTO range emitted into this packet was selected
+    /// from the recovery retransmission set. This intentionally excludes
+    /// multipath buffered copies, which are replication/scheduling state and
+    /// not loss recovery.
+    contains_retransmission: bool,
 }
 
 /// Handshake status for loss recovery
@@ -4914,6 +4980,7 @@ pub(crate) mod tests {
                 src: if is_server { server_addr } else { client_addr },
                 dst: if is_server { client_addr } else { server_addr },
                 time: time::Instant::now(),
+                send_meta: PacketSendMeta::default(),
             }
         }
 
@@ -5228,6 +5295,7 @@ pub(crate) mod tests {
             src: initial_info.dst,
             dst: initial_info.src,
             time: initial_info.time,
+            send_meta: PacketSendMeta::default(),
         };
 
         // Client drop the Version Negotiation packet with the same version.
@@ -5276,6 +5344,7 @@ pub(crate) mod tests {
             src: info.dst,
             dst: info.src,
             time: info.time,
+            send_meta: PacketSendMeta::default(),
         };
 
         // Client recv Retry
@@ -7984,6 +8053,70 @@ pub(crate) mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn packet_send_meta_keeps_handshake_liveness_outside_data_budget() {
+        let crypto = frame::Frame::Crypto {
+            offset: 0,
+            length: 3,
+            data: Bytes::from_static(b"tls"),
+        };
+        let crypto_meta = Connection::packet_send_meta(&[crypto], PacketType::Initial, false, true);
+        assert!(crypto_meta.contains_handshake);
+        assert!(crypto_meta.contains_retransmission);
+        assert!(!crypto_meta.contains_data);
+        assert!(crypto_meta.is_control_only());
+
+        let mut ack_ranges = RangeSet::new(1);
+        ack_ranges.insert(1..2);
+        let mixed_meta = Connection::packet_send_meta(
+            &[
+                frame::Frame::Ack {
+                    ack_delay: 0,
+                    ack_ranges,
+                    ecn_counts: None,
+                },
+                frame::Frame::PathChallenge { data: [7; 8] },
+                frame::Frame::Stream {
+                    stream_id: 0,
+                    offset: 0,
+                    length: 7,
+                    fin: false,
+                    data: Bytes::from_static(b"payload"),
+                },
+            ],
+            PacketType::OneRTT,
+            false,
+            false,
+        );
+        assert!(mixed_meta.contains_data);
+        assert!(mixed_meta.contains_ack);
+        assert!(mixed_meta.contains_path_validation);
+        assert!(
+            !mixed_meta.is_control_only(),
+            "mixed ACK+STREAM consumes data credit"
+        );
+
+        let control_meta = Connection::packet_send_meta(
+            &[
+                frame::Frame::Ping {
+                    pmtu_probe: Some((0, 1200)),
+                },
+                frame::Frame::ApplicationClose {
+                    error_code: 0,
+                    reason: Vec::new(),
+                },
+                frame::Frame::HandshakeDone,
+            ],
+            PacketType::OneRTT,
+            true,
+            false,
+        );
+        assert!(control_meta.contains_probe);
+        assert!(control_meta.contains_close);
+        assert!(control_meta.contains_handshake);
+        assert!(control_meta.is_control_only());
     }
 }
 
