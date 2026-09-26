@@ -693,9 +693,51 @@ impl Endpoint {
         let mut sent = FxHashSet::default();
         let mut total = 0;
 
-        while self.conn_sendable_len() > 0 {
+        // Whether the local packet queue is currently backpressured, i.e. a
+        // previous drain attempt below could not hand off everything sitting
+        // at the front of the queue (e.g. the sender is paused/blocked).
+        // This is deliberately checked at the top of the outer loop, not per
+        // connection: `self.packets` is one global FIFO shared by every
+        // connection/path multiplexed onto this endpoint, so once its head
+        // is stuck, generating more packets for *any* connection would only
+        // grow the queue further without making the stuck head any less
+        // stuck. The queue is therefore capped at one outstanding batch
+        // across the whole endpoint, not per connection or per path.
+        let mut blocked = false;
+
+        while !blocked && self.conn_sendable_len() > 0 {
             // Iterate over connections that have packets to send.
             while let Some(idx) = self.conn_sendable_next() {
+                // Drain-first: never generate a new packet while a previous
+                // batch is still sitting undrained in the queue. Without
+                // this, a blocked `on_packets_send()` (which may legitimately
+                // return fewer than `pkts.len()`) leaves packets at the
+                // front of the FIFO while the loop below keeps calling
+                // `conn.send()` and appending to the back, growing the queue
+                // without bound.
+                if !self.packets.is_empty() {
+                    let batch = self.packets.next_batch();
+                    let sent_indices = match self.sender.on_packets_send_sparse(batch) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("{} send packet err: {:?}", &self.trace_id, e);
+                            return Err(e);
+                        }
+                    };
+                    total += sent_indices.len();
+                    self.packets.drain_sparse(&sent_indices);
+
+                    if !self.packets.is_empty() {
+                        // Still backpressured after retrying: stop
+                        // generating for this call. The caller is expected
+                        // to invoke `send_packets_out` again once the sender
+                        // signals it can make progress (e.g. a governed
+                        // sender's retry-at wake-up).
+                        blocked = true;
+                        break;
+                    }
+                }
+
                 if let Some(conn) = self.conns.get_mut(idx) {
                     if conn.is_draining() || conn.is_closed() {
                         conn.mark_sendable(false);
@@ -703,7 +745,7 @@ impl Endpoint {
                     }
 
                     let mut buf = self.packets.get_buffer();
-                    match conn.send(&mut buf) {
+                    match conn.send(&mut buf, self.sender.as_ref()) {
                         Ok((len, info)) => {
                             buf.truncate(len);
                             self.packets.add_packet(buf, info);
@@ -728,15 +770,20 @@ impl Endpoint {
 
                 if self.packets.has_full_batch() {
                     let batch = self.packets.next_batch();
-                    let done = match self.sender.on_packets_send(batch) {
+                    let sent_indices = match self.sender.on_packets_send_sparse(batch) {
                         Ok(v) => v,
                         Err(e) => {
                             error!("{} send packet err: {:?}", &self.trace_id, e);
                             return Err(e);
                         }
                     };
-                    self.packets.drain_front(done);
-                    total += done;
+                    total += sent_indices.len();
+                    self.packets.drain_sparse(&sent_indices);
+
+                    if !self.packets.is_empty() {
+                        blocked = true;
+                        break;
+                    }
                 };
             }
         }
@@ -760,12 +807,12 @@ impl Endpoint {
                 &self.trace_id,
             );
 
-            let done = self.sender.on_packets_send(batch)?;
-            if done == 0 {
+            let sent_indices = self.sender.on_packets_send_sparse(batch)?;
+            if sent_indices.is_empty() {
                 break;
             }
-            total += done;
-            self.packets.drain_front(done);
+            total += sent_indices.len();
+            self.packets.drain_sparse(&sent_indices);
             batch = self.packets.next_batch();
         }
 
@@ -1077,13 +1124,40 @@ impl PacketQueue {
         self.packets.len() >= self.batch_size
     }
 
-    /// Remove the sent packets and put the used buffers to the buffer pool.
-    fn drain_front(&mut self, n: usize) {
-        let len = cmp::min(n, self.packets.len());
-        for mut p in self.packets.drain(..len) {
-            p.0.resize(MAX_BUFFER_SIZE, 0);
-            self.buffers.push_back(p.0);
+    /// Remove exactly the packets at `sent_indices` (0-based positions from
+    /// the front of the queue, as returned by
+    /// `PacketSendHandler::on_packets_send_sparse`), preserving the relative
+    /// order of whatever remains. The removed set need not be a contiguous
+    /// prefix: a packet that was not sent (e.g. paused application data)
+    /// stays queued at its relative position while packets sent around it
+    /// are removed. Passing `0..n` reproduces plain prefix-draining.
+    ///
+    /// `sent_indices` is expected to be strictly increasing and within
+    /// bounds, per the `on_packets_send_sparse` contract; out-of-bounds
+    /// indices are ignored rather than panicking, so a misbehaving
+    /// implementation cannot corrupt the queue.
+    fn drain_sparse(&mut self, sent_indices: &[usize]) {
+        if sent_indices.is_empty() {
+            return;
         }
+
+        let mut sent = vec![false; self.packets.len()];
+        for &i in sent_indices {
+            if let Some(slot) = sent.get_mut(i) {
+                *slot = true;
+            }
+        }
+
+        let mut remaining = VecDeque::with_capacity(self.packets.len());
+        for (idx, mut p) in self.packets.drain(..).enumerate() {
+            if sent.get(idx).copied().unwrap_or(false) {
+                p.0.resize(MAX_BUFFER_SIZE, 0);
+                self.buffers.push_back(p.0);
+            } else {
+                remaining.push_back(p);
+            }
+        }
+        self.packets = remaining;
     }
 
     /// Get a packet buffer from the buffer pool.
@@ -2753,5 +2827,61 @@ mod tests {
 
         t.run(cli_conf, srv_conf, case_conf)?;
         Ok(())
+    }
+
+    fn drain_sparse_test_packet_info() -> PacketInfo {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234);
+        PacketInfo {
+            src: addr,
+            dst: addr,
+            time: Instant::now(),
+            send_meta: crate::PacketSendMeta::default(),
+        }
+    }
+
+    #[test]
+    fn packet_queue_drain_sparse_keeps_unsent_indices_queued_in_order() {
+        let mut queue = PacketQueue::new(8);
+        // Tag each packet's first byte so we can tell which ones survive.
+        queue.add_packet(vec![0u8; 4], drain_sparse_test_packet_info());
+        queue.add_packet(vec![1u8; 4], drain_sparse_test_packet_info());
+        queue.add_packet(vec![2u8; 4], drain_sparse_test_packet_info());
+
+        // Sparse-drain only the middle packet (index 1): unlike a prefix
+        // drain, packets 0 and 2 must both remain queued, in their original
+        // relative order -- this is the mechanism that lets a Control
+        // packet queued behind a paused Data packet still go out.
+        queue.drain_sparse(&[1]);
+
+        assert!(!queue.is_empty());
+        let batch = queue.next_batch();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].0[0], 0);
+        assert_eq!(batch[1].0[0], 2);
+    }
+
+    #[test]
+    fn packet_queue_drain_sparse_is_noop_on_empty_indices() {
+        let mut queue = PacketQueue::new(8);
+        queue.add_packet(vec![7u8; 4], drain_sparse_test_packet_info());
+
+        queue.drain_sparse(&[]);
+
+        assert!(!queue.is_empty());
+        assert_eq!(queue.next_batch().len(), 1);
+    }
+
+    #[test]
+    fn packet_queue_drain_sparse_ignores_out_of_bounds_indices() {
+        let mut queue = PacketQueue::new(8);
+        queue.add_packet(vec![9u8; 4], drain_sparse_test_packet_info());
+
+        // A misbehaving `on_packets_send_sparse` implementation reporting an
+        // index past the end of the batch must not panic or corrupt the
+        // queue; the in-bounds packet stays queued.
+        queue.drain_sparse(&[5]);
+
+        assert!(!queue.is_empty());
+        assert_eq!(queue.next_batch().len(), 1);
     }
 }

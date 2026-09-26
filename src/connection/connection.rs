@@ -73,6 +73,7 @@ use crate::FourTuple;
 use crate::FourTupleIter;
 use crate::MultipathConfig;
 use crate::PacketInfo;
+use crate::PacketSendHandler;
 use crate::PacketSendMeta;
 use crate::PathEvent;
 use crate::PathStats;
@@ -1542,7 +1543,17 @@ impl Connection {
     /// exceeding the maximum possible MTU.
     ///
     /// Return Error::Done if no packet can be sent.
-    pub(crate) fn send(&mut self, out: &mut [u8]) -> Result<(usize, PacketInfo)> {
+    ///
+    /// `sender` is consulted (via `PacketSendHandler::can_send_data`) before
+    /// application-data frames are written into a 1-RTT packet; it is not
+    /// otherwise used to actually deliver the generated packet (that happens
+    /// later, when the caller hands the returned bytes to
+    /// `PacketSendHandler::on_packets_send`).
+    pub(crate) fn send(
+        &mut self,
+        out: &mut [u8],
+        sender: &dyn PacketSendHandler,
+    ) -> Result<(usize, PacketInfo)> {
         if out.len() < crate::MIN_CLIENT_INITIAL_LEN {
             return Err(Error::BufferTooShort);
         }
@@ -1583,12 +1594,18 @@ impl Connection {
         // Write QUIC packets to the buffer
         let mut has_initial = false;
         while left > 0 {
-            let (pkt_type, is_pmtu_probe, written, packet_meta) =
-                match self.send_packet(&mut out[done..], left, pid, done == 0, has_initial) {
-                    Ok(v) => v,
-                    Err(Error::BufferTooShort) | Err(Error::Done) => break,
-                    Err(e) => return Err(e),
-                };
+            let (pkt_type, is_pmtu_probe, written, packet_meta) = match self.send_packet(
+                &mut out[done..],
+                left,
+                pid,
+                done == 0,
+                has_initial,
+                sender,
+            ) {
+                Ok(v) => v,
+                Err(Error::BufferTooShort) | Err(Error::Done) => break,
+                Err(e) => return Err(e),
+            };
 
             send_meta.contains_data |= packet_meta.contains_data;
             send_meta.contains_ack |= packet_meta.contains_ack;
@@ -1668,6 +1685,7 @@ impl Connection {
         path_id: usize,
         first: bool,
         has_initial: bool,
+        sender: &dyn PacketSendHandler,
     ) -> Result<(PacketType, bool, usize, PacketSendMeta)> {
         let now = time::Instant::now();
 
@@ -1778,6 +1796,7 @@ impl Connection {
             path_id,
             first,
             has_initial,
+            sender,
         ) {
             Ok(..) => (),
             Err(Error::Done) if write_status.written > 0 => (), // at least one frame was written
@@ -1963,6 +1982,7 @@ impl Connection {
         path_id: usize,
         first: bool,
         has_initial: bool,
+        sender: &dyn PacketSendHandler,
     ) -> Result<()> {
         // Write an ACK frame
         self.try_write_ack_frame(&mut buf[..left], st, pkt_type, path_id)?;
@@ -2020,11 +2040,38 @@ impl Connection {
         // Write a CRYPTO frame
         self.try_write_crypto_frame(out, st, pkt_type, path_id)?;
 
+        // Data gate: ask the sender whether it currently has budget for more
+        // application-data bytes before writing STREAM frames -- fresh ones
+        // below, and multipath buffered/retransmitted ones just above them.
+        // Both write Frame::Stream and both carry line-rate application
+        // bytes, so they share one gate; bypassing it for buffered frames
+        // would let a paused sender keep leaking retransmitted data. This is
+        // deliberately queried after ACK/CLOSE/PATH_CHALLENGE/HANDSHAKE_DONE/
+        // CRYPTO are already written above in this function and before PING
+        // at the bottom of it, so a closed gate still produces a
+        // control-only, ack-eliciting packet (PING) instead of Error::Done
+        // -- see PacketSendHandler::can_send_data.
+        let data_gate_open = if pkt_type == PacketType::OneRTT || pkt_type == PacketType::ZeroRTT
+        {
+            let path = self.paths.get(path_id)?;
+            sender.can_send_data(
+                path.local_addr(),
+                path.remote_addr(),
+                path.recovery.max_datagram_size as usize,
+            )
+        } else {
+            true
+        };
+
         // Write buffered frames
-        self.try_write_buffered_frames(out, st, pkt_type, path_id)?;
+        if data_gate_open {
+            self.try_write_buffered_frames(out, st, pkt_type, path_id)?;
+        }
 
         // Write STREAM frames
-        self.try_write_stream_frames(out, st, pkt_type, path_id)?;
+        if data_gate_open {
+            self.try_write_stream_frames(out, st, pkt_type, path_id)?;
+        }
 
         // Write a NEW_TOKEN frame
         self.try_write_new_token_frame(out, st, pkt_type, path_id)?;
@@ -4681,6 +4728,51 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tempfile::NamedTempFile;
 
+    /// A trivial `PacketSendHandler` for tests that exercise `Connection::send`
+    /// directly, bypassing `Endpoint`. `on_packets_send` is never actually
+    /// invoked by these tests (they collect the bytes returned by `send()`
+    /// themselves), and the default `can_send_data` (always admit) matches
+    /// the pre-data-gate behavior these tests were written against.
+    struct NoopSender;
+
+    impl PacketSendHandler for NoopSender {
+        fn on_packets_send(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> Result<usize> {
+            Ok(pkts.len())
+        }
+    }
+
+    /// A `PacketSendHandler` whose `can_send_data` answer is fixed at
+    /// construction, for exercising `send_frames`'s data gate directly via
+    /// `Connection::send`. Like `NoopSender`, `on_packets_send` is never
+    /// actually invoked by these tests.
+    struct GateSender {
+        data_admitted: bool,
+    }
+
+    impl GateSender {
+        fn open() -> Self {
+            Self {
+                data_admitted: true,
+            }
+        }
+
+        fn closed() -> Self {
+            Self {
+                data_admitted: false,
+            }
+        }
+    }
+
+    impl PacketSendHandler for GateSender {
+        fn on_packets_send(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> Result<usize> {
+            Ok(pkts.len())
+        }
+
+        fn can_send_data(&self, _local: SocketAddr, _remote: SocketAddr, _bytes: usize) -> bool {
+            self.data_admitted
+        }
+    }
+
     pub struct TestPair {
         pub client: Connection,
         pub server: Connection,
@@ -4789,7 +4881,7 @@ pub(crate) mod tests {
             let mut packets = Vec::new();
             loop {
                 let mut out = vec![0u8; 1500];
-                let info = match conn.send(&mut out) {
+                let info = match conn.send(&mut out, &NoopSender) {
                     Ok((written, info)) => {
                         out.truncate(written);
                         info
@@ -5940,7 +6032,7 @@ pub(crate) mod tests {
             .client
             .stream_write(0, Bytes::from(vec![0; 2000]), true)
             .is_ok());
-        let r = test_pair.client.send(&mut buf);
+        let r = test_pair.client.send(&mut buf, &NoopSender);
         assert!(r.is_ok());
         assert_eq!(r.unwrap().0, mds_ipv4);
 
@@ -7398,7 +7490,7 @@ pub(crate) mod tests {
         let mut packets = Vec::new();
         for i in 0..4 {
             let mut out = vec![0u8; 1500];
-            let info = match test_pair.client.send(&mut out) {
+            let info = match test_pair.client.send(&mut out, &NoopSender) {
                 Ok((written, info)) => {
                     out.truncate(written);
                     info
@@ -8117,6 +8209,75 @@ pub(crate) mod tests {
         assert!(control_meta.contains_close);
         assert!(control_meta.contains_handshake);
         assert!(control_meta.is_control_only());
+    }
+
+    #[test]
+    fn data_gate_closed_keeps_ack_flowing_but_suppresses_stream_data() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        assert_eq!(test_pair.handshake(), Ok(()));
+
+        // Give the client data to send, and deliver it to the server so the
+        // server now owes the client an ACK. Then give the server its own
+        // data to send back: with the gate open this would naturally
+        // coalesce ACK + STREAM into a single Data-classified packet -- the
+        // exact scenario that traps a piggybacked ACK behind paused data.
+        let (sid, data) = (0, TestPair::new_test_data(10));
+        test_pair.client.stream_write(sid, data.clone(), true)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        test_pair.server.stream_write(sid, data, false)?;
+
+        // With the data gate closed, the server's next packet must still
+        // carry the pending ACK, but must not carry the pending STREAM data.
+        let gate = GateSender::closed();
+        let mut buf = vec![0u8; 1500];
+        let (written, info) = test_pair.server.send(&mut buf, &gate)?;
+        buf.truncate(written);
+        assert!(
+            info.send_meta.contains_ack,
+            "ACK must not be trapped behind a closed data gate"
+        );
+        assert!(
+            !info.send_meta.contains_data,
+            "STREAM frames must not be written while the data gate is closed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn data_gate_reopen_lets_stream_frames_through() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        assert_eq!(test_pair.handshake(), Ok(()));
+
+        // Stream 1 is server-initiated bidi, so the server can open it
+        // unilaterally without any prior client activity on it.
+        let (sid, data) = (1, TestPair::new_test_data(10));
+        test_pair.server.stream_write(sid, data, false)?;
+
+        // Closed, with nothing else pending: no STREAM frame is written and
+        // the packet is empty, exactly like the pre-gate "no frames" path.
+        let closed = GateSender::closed();
+        let mut buf = vec![0u8; 1500];
+        match test_pair.server.send(&mut buf, &closed) {
+            Err(Error::Done) => {}
+            other => panic!(
+                "nothing else is pending, so a closed gate must yield no packet, got {:?}",
+                other.map(|(written, _)| written)
+            ),
+        }
+
+        // Reopened: the same pending STREAM data is now written -- the gate
+        // is a live, per-call query, not a one-shot latch.
+        let open = GateSender::open();
+        let (written, info) = test_pair.server.send(&mut buf, &open)?;
+        buf.truncate(written);
+        assert!(
+            info.send_meta.contains_data,
+            "data must flow again once the gate reopens"
+        );
+
+        Ok(())
     }
 }
 

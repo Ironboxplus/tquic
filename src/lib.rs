@@ -1085,6 +1085,56 @@ pub trait PacketSendHandler {
     /// this is less than `pkts.len()`, the connection will retry with a further
     /// `on_packets_send()` call to send the remaining messages.
     fn on_packets_send(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> Result<usize>;
+
+    /// Called before writing application-data frames (fresh STREAM frames,
+    /// and multipath buffered/retransmitted STREAM frames) into a 1-RTT
+    /// packet on the given path, to ask whether the sender currently has
+    /// budget for `bytes` more bytes of application payload.
+    ///
+    /// This is a point-in-time query, not a reservation: a caller that
+    /// returns `true` is not charged for `bytes`, so a single
+    /// `Connection::send()` call may query this multiple times against the
+    /// same unspent budget before any of the resulting packets reach
+    /// `on_packets_send()`. Implementations that need generation-time
+    /// admission control (e.g. a rate-governed sender) MUST additionally
+    /// bound how many un-accounted packets can be generated per query --
+    /// e.g. via `Config::set_send_batch_size(1)`, which hands each generated
+    /// packet to `on_packets_send()` (and lets the caller account for it)
+    /// before the next packet is generated.
+    ///
+    /// ACK, CONNECTION_CLOSE, PATH_CHALLENGE/PATH_RESPONSE, HANDSHAKE_DONE,
+    /// CRYPTO, and PING frames are never gated by this call: control traffic
+    /// (including a loss-probe PING sent while this gate is closed) must
+    /// stay deliverable so the connection does not stall while application
+    /// data is paused.
+    ///
+    /// The default implementation always admits data, preserving prior
+    /// behavior for callers that do not need to pace application data
+    /// independently of congestion control.
+    fn can_send_data(&self, _local: SocketAddr, _remote: SocketAddr, _bytes: usize) -> bool {
+        true
+    }
+
+    /// Sparse variant of `on_packets_send`.
+    ///
+    /// `on_packets_send` must be interpreted as a sent PREFIX of `pkts`: if
+    /// it returns fewer than `pkts.len()`, every packet from that point on
+    /// is treated as unsent, even ones that could have gone out on their
+    /// own. `on_packets_send_sparse` instead reports exactly which packets
+    /// (by index into `pkts`) were sent, so a packet that could not be sent
+    /// (e.g. an application-data packet paused by a rate governor) does not
+    /// head-of-line-block a sendable packet queued after it (e.g. a Control
+    /// packet, or a Data packet on a different, unblocked path).
+    ///
+    /// The returned indices must be a subset of `0..pkts.len()`, need not be
+    /// contiguous, but MUST be strictly increasing.
+    ///
+    /// The default implementation preserves prefix semantics by delegating
+    /// to `on_packets_send` and reporting `0..done` as sent.
+    fn on_packets_send_sparse(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> Result<Vec<usize>> {
+        let done = self.on_packets_send(pkts)?;
+        Ok((0..done).collect())
+    }
 }
 
 /// The stream's side to shutdown.
