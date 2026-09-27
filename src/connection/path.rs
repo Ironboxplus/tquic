@@ -352,8 +352,17 @@ impl Path {
     }
 
     /// Set the externally optimized send-rate target for this path.
+    ///
+    /// MP_SQM_PLAN.md S2.4: also forwarded straight into the path's own
+    /// congestion controller (`CongestionController::set_target_rate`).
+    /// Every measurement-driven algorithm keeps this a no-op default; for
+    /// `Brutal` specifically, this rate *is* its congestion window/pacing
+    /// rate input, so an MP max-flow allocation becomes each path's actual
+    /// Brutal send rate directly, with no separate negotiation channel
+    /// between the optimizer and the congestion controller.
     pub(crate) fn set_scheduler_target_rate(&mut self, rate: Option<u64>) {
         self.scheduler_target_rate = rate;
+        self.recovery.congestion.set_target_rate(rate);
         if rate == Some(0) {
             self.active = false;
         } else if self.validated() && !self.is_abandon {

@@ -29,6 +29,8 @@ pub use bbr::Bbr;
 pub use bbr::BbrConfig;
 pub use bbr3::Bbr3;
 pub use bbr3::Bbr3Config;
+pub use brutal::Brutal;
+pub use brutal::BrutalConfig;
 pub use copa::Copa;
 pub use copa::CopaConfig;
 pub use copa::COPA_DELTA;
@@ -70,6 +72,15 @@ pub enum CongestionControlAlgorithm {
     /// Dummy is a simple congestion controller with a static congestion window.
     /// It is intended to be used for testing and experiments.
     Dummy,
+
+    /// Brutal (MP_SQM_PLAN.md S2.4, ported from Hysteria's
+    /// `internal/congestion/brutal`) sends at a fixed, externally supplied
+    /// rate rather than inferring one from measurements -- intended for
+    /// links whose true capacity is already known out of band (e.g. an MP
+    /// max-flow allocation). It self-compensates for measured loss by
+    /// inflating its window/pacing rate, unless that compensation is
+    /// disabled.
+    Brutal,
 }
 
 impl FromStr for CongestionControlAlgorithm {
@@ -86,6 +97,8 @@ impl FromStr for CongestionControlAlgorithm {
             Ok(CongestionControlAlgorithm::Copa)
         } else if algor.eq_ignore_ascii_case("dummy") {
             Ok(CongestionControlAlgorithm::Dummy)
+        } else if algor.eq_ignore_ascii_case("brutal") {
+            Ok(CongestionControlAlgorithm::Brutal)
         } else {
             Err(Error::InvalidConfig("unknown".into()))
         }
@@ -209,6 +222,16 @@ pub trait CongestionController {
     fn bandwidth_metrics(&self) -> Option<BandwidthMetrics> {
         None
     }
+
+    /// Set (or clear) an externally supplied target send rate, in bytes/sec
+    /// (MP_SQM_PLAN.md S2.4). Every measurement-driven algorithm (CUBIC,
+    /// BBR/BBRv3, COPA) keeps the default no-op: they derive their own rate
+    /// and have nothing to overwrite it with. Only rate-driven algorithms
+    /// (`Brutal`) act on this -- for `Brutal` specifically, this is its only
+    /// source of rate, fed by `Path::set_scheduler_target_rate` so an MP
+    /// max-flow allocation becomes each path's actual send rate with no
+    /// separate channel.
+    fn set_target_rate(&mut self, bps: Option<u64>) {}
 }
 
 impl fmt::Debug for dyn CongestionController {
@@ -225,6 +248,7 @@ pub fn build_congestion_controller(conf: &RecoveryConfig) -> Box<dyn CongestionC
         CongestionControlAlgorithm::Bbr3 => Box::new(Bbr3::new(Bbr3Config::from(conf))),
         CongestionControlAlgorithm::Copa => Box::new(Copa::new(CopaConfig::from(conf))),
         CongestionControlAlgorithm::Dummy => Box::new(Dummy::new(DummyConfig::from(conf))),
+        CongestionControlAlgorithm::Brutal => Box::new(Brutal::new(BrutalConfig::from(conf))),
     }
 }
 
@@ -305,6 +329,7 @@ mod tests {
 
 mod bbr;
 mod bbr3;
+mod brutal;
 mod copa;
 mod cubic;
 mod delivery_rate;

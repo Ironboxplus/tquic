@@ -542,6 +542,20 @@ impl Config {
         self.recovery.congestion_control_algorithm = cca;
     }
 
+    /// Set Brutal's fixed target send rate, in bytes/sec. Only meaningful
+    /// when the congestion control algorithm is `Brutal`. The default value
+    /// is `0`, which `Brutal::congestion_window`/`pacing_rate` treat as "not
+    /// yet configured" rather than a real zero-rate target.
+    pub fn set_brutal_bps(&mut self, bps: u64) {
+        self.recovery.brutal_bps = bps;
+    }
+
+    /// Disable Brutal's ack-rate loss compensation. The default value is
+    /// `false` (compensation enabled).
+    pub fn set_brutal_disable_loss_compensation(&mut self, disable: bool) {
+        self.recovery.brutal_disable_loss_compensation = disable;
+    }
+
     /// Set the initial congestion window in packets.
     /// The default value is 10.
     pub fn set_initial_congestion_window(&mut self, packets: u64) {
@@ -895,6 +909,20 @@ pub struct RecoveryConfig {
 
     /// Upper limit of probe timeout.
     pub max_pto: Duration,
+
+    /// Brutal's fixed target send rate, in bytes/sec (MP_SQM_PLAN.md S2.4).
+    /// Unlike every other algorithm here, Brutal does not infer a rate from
+    /// measurements -- the caller (an outside rate negotiation, or an MP
+    /// max-flow allocation via `Path::set_scheduler_target_rate`) always
+    /// supplies it. Only meaningful when `congestion_control_algorithm` is
+    /// `Brutal`.
+    pub brutal_bps: u64,
+
+    /// Disable Brutal's ack-rate loss compensation (MP_SQM_PLAN.md S2.4):
+    /// when `true`, `ack_rate` stays pinned at `1.0` regardless of measured
+    /// loss, so `congestion_window`/`pacing_rate` never inflate to
+    /// compensate for it.
+    pub brutal_disable_loss_compensation: bool,
 }
 
 impl Default for RecoveryConfig {
@@ -921,6 +949,8 @@ impl Default for RecoveryConfig {
             pacing_granularity: time::Duration::from_millis(1),
             pto_linear_factor: DEFAULT_PTO_LINEAR_FACTOR,
             max_pto: MAX_PTO,
+            brutal_bps: 0,
+            brutal_disable_loss_compensation: false,
         }
     }
 }
