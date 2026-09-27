@@ -107,10 +107,20 @@ impl Default for BrutalConfig {
 /// rationale and TQUIC-specific adaptations.
 #[derive(Debug)]
 pub struct Brutal {
-    /// Fixed target send rate, in bytes/sec. Mutable at runtime via
-    /// `set_target_rate` -- an MP max-flow allocation changes this directly,
-    /// with no reconnect required.
-    bps: u64,
+    /// The fixed rate this path was configured with (`up_mbps`, converted to
+    /// bytes/sec), i.e. a hard ceiling. `set_target_rate` (an MP max-flow
+    /// allocation, or a peer's negotiated rx cap) can only lower the
+    /// *effective* rate below this -- see `effective_bps` -- never raise it
+    /// above it, so a generous allocation elsewhere can never push a path
+    /// past what the user actually configured.
+    configured_bps: u64,
+
+    /// Last value passed to `set_target_rate`. `None` means "no external
+    /// target installed, use `configured_bps` natively" -- the same meaning
+    /// `Path::set_scheduler_target_rate(None)` documents ("restores the
+    /// scheduler's native congestion-control/RTT policy"). See
+    /// `effective_bps` for how `Some(0)` is handled.
+    external_target: Option<u64>,
 
     max_datagram_size: u64,
 
@@ -142,7 +152,8 @@ pub struct Brutal {
 impl Brutal {
     pub fn new(conf: BrutalConfig) -> Self {
         Self {
-            bps: conf.bps,
+            configured_bps: conf.bps,
+            external_target: None,
             max_datagram_size: crate::DEFAULT_SEND_UDP_PAYLOAD_SIZE as u64,
             ack_rate: 1.0,
             disable_loss_compensation: conf.disable_loss_compensation,
@@ -150,6 +161,21 @@ impl Brutal {
             epoch: Instant::now(),
             srtt: Duration::ZERO,
             stats: CongestionStats::default(),
+        }
+    }
+
+    /// The rate `congestion_window`/`pacing_rate` actually use: `configured_
+    /// bps` clamped down (never up) by whatever `set_target_rate` last
+    /// installed. `Some(0)` -- "exclude this path from scheduling" -- is
+    /// handled by TQUIC's own `Path::active` flag (set by the same
+    /// `set_scheduler_target_rate` call that reaches `set_target_rate`), so
+    /// treating it as "no target" here (rather than actually zeroing the
+    /// window/pacing math) avoids reporting a degenerate all-zero cwnd/pacing
+    /// rate for a path that is merely paused, not gone.
+    fn effective_bps(&self) -> u64 {
+        match self.external_target {
+            Some(0) | None => self.configured_bps,
+            Some(target) => self.configured_bps.min(target),
         }
     }
 
@@ -275,14 +301,14 @@ impl CongestionController for Brutal {
         if self.srtt.is_zero() {
             return NO_RTT_CONGESTION_WINDOW.max(self.max_datagram_size);
         }
-        let cwnd =
-            (self.bps as f64 * self.srtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER
-                / self.ack_rate) as u64;
+        let cwnd = (self.effective_bps() as f64 * self.srtt.as_secs_f64()
+            * CONGESTION_WINDOW_MULTIPLIER
+            / self.ack_rate) as u64;
         cwnd.max(self.max_datagram_size)
     }
 
     fn pacing_rate(&self) -> Option<u64> {
-        Some((self.bps as f64 / self.ack_rate) as u64)
+        Some((self.effective_bps() as f64 / self.ack_rate) as u64)
     }
 
     fn initial_window(&self) -> u64 {
@@ -302,7 +328,7 @@ impl CongestionController for Brutal {
     }
 
     fn set_target_rate(&mut self, bps: Option<u64>) {
-        self.bps = bps.unwrap_or(0);
+        self.external_target = bps;
     }
 }
 
@@ -403,14 +429,56 @@ mod tests {
         assert_eq!(b.ack_rate, 1.0);
     }
 
+    /// `set_target_rate` can only lower the effective rate below `configured_
+    /// bps` -- never raise it. Ported from a real review finding: the first
+    /// implementation set `self.bps = bps.unwrap_or(0)` unconditionally, so
+    /// `set_target_rate(None)` (TQUIC's normal "clear the external target,
+    /// restore native policy" call, issued whenever an MP allocation stops
+    /// covering a path) zeroed Brutal's rate outright instead of restoring
+    /// the configured one, and a generous allocation could push a path's
+    /// rate above what the user actually configured.
     #[test]
-    fn set_target_rate_updates_bps_live() {
+    fn set_target_rate_clamps_down_from_configured_and_none_restores_it() {
         let mut b = brutal(1_000_000, false);
-        assert_eq!(b.pacing_rate(), Some(1_000_000));
+        assert_eq!(b.pacing_rate(), Some(1_000_000), "starts at configured_bps");
+
+        // A lower external target (e.g. a conservative MP allocation, or a
+        // peer's negotiated rx cap) takes effect.
+        b.set_target_rate(Some(400_000));
+        assert_eq!(b.pacing_rate(), Some(400_000));
+
+        // A *higher* external target than configured must be clamped down to
+        // configured_bps, never raise the path above what the user set.
         b.set_target_rate(Some(5_000_000));
-        assert_eq!(b.pacing_rate(), Some(5_000_000));
+        assert_eq!(
+            b.pacing_rate(),
+            Some(1_000_000),
+            "external target above configured_bps must be clamped, not applied"
+        );
+
+        // `None` -- "restore native policy" -- must restore configured_bps,
+        // not zero.
         b.set_target_rate(None);
-        assert_eq!(b.pacing_rate(), Some(0));
+        assert_eq!(b.pacing_rate(), Some(1_000_000));
+    }
+
+    /// `Some(0)` means "exclude this path" via TQUIC's own `Path::active`
+    /// flag (set by the same `set_scheduler_target_rate` call before it ever
+    /// reaches `set_target_rate`); Brutal itself must keep reporting its
+    /// normal configured cwnd/pacing rather than a degenerate all-zero one,
+    /// since nothing here actually stops packets from being scheduled -- that
+    /// is `Path::active`'s job, not the congestion controller's.
+    #[test]
+    fn set_target_rate_some_zero_does_not_zero_the_window_math() {
+        let mut b = brutal(1_000_000, false);
+        b.srtt = Duration::from_millis(100);
+        let baseline_cwnd = b.congestion_window();
+        assert!(baseline_cwnd > b.max_datagram_size);
+
+        b.set_target_rate(Some(0));
+
+        assert_eq!(b.pacing_rate(), Some(1_000_000));
+        assert_eq!(b.congestion_window(), baseline_cwnd);
     }
 
     /// MP_SQM_PLAN.md S2.4 RED requirement: "TQUIC 测试夹具注入 10% 丢包时吞吐
@@ -458,6 +526,57 @@ mod tests {
             delivered_bps >= target_bps as f64 * 0.9,
             "delivered {delivered_bps} bps below 90% of target {target_bps} bps"
         );
+    }
+
+    /// Same 10% loss scenario as the test above, but driven through the real
+    /// `CongestionController` trait callbacks (`on_sent`/`begin_ack`/`on_ack`/
+    /// `end_ack`/`on_congestion_event`) instead of calling the private
+    /// `record_ack`/`record_loss` helpers directly -- proving the wiring a
+    /// live `Path`/`Recovery` actually drives, not just the internal counting
+    /// logic those helpers implement, reaches the same `ack_rate`/`pacing_
+    /// rate` (MP_SQM_PLAN.md S2.4 review item 5).
+    #[test]
+    fn real_on_ack_and_on_congestion_event_calls_converge_to_the_same_ack_rate_and_pacing() {
+        let target_bps = 20_000_000u64;
+        let mut b = brutal(target_bps, false);
+        let rtt_estimator = RttEstimator::new(Duration::from_millis(20));
+        let packets_per_second = 100u64;
+        let lost_per_second = 10u64; // 10%
+        let acked_per_second = packets_per_second - lost_per_second;
+
+        for second in 0..(PKT_INFO_SLOT_COUNT as u64 + 2) {
+            let now = b.epoch + Duration::from_secs(second);
+            for _ in 0..acked_per_second {
+                let mut packet = SentPacket {
+                    sent_size: 1200,
+                    ack_eliciting: true,
+                    in_flight: true,
+                    ..SentPacket::default()
+                };
+                b.on_sent(now, &mut packet, 0);
+                b.begin_ack(now, 0);
+                b.on_ack(&mut packet, now, false, &rtt_estimator, 0);
+                b.end_ack();
+            }
+            for _ in 0..lost_per_second {
+                let mut packet = SentPacket {
+                    sent_size: 1200,
+                    ack_eliciting: true,
+                    in_flight: true,
+                    ..SentPacket::default()
+                };
+                b.on_sent(now, &mut packet, 0);
+                b.on_congestion_event(now, &packet, false, packet.sent_size as u64, 0);
+            }
+        }
+
+        assert!(
+            (b.ack_rate - 0.9).abs() < 1e-9,
+            "expected ack_rate ~0.9 for steady 10% loss driven through the real callbacks, got {}",
+            b.ack_rate
+        );
+        let expected_pacing = (target_bps as f64 / 0.9) as u64;
+        assert_eq!(b.pacing_rate(), Some(expected_pacing));
     }
 
     #[test]

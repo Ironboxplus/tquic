@@ -716,6 +716,8 @@ impl PathMap {
 mod tests {
     use super::*;
     use crate::congestion_control::CongestionControlAlgorithm;
+    use crate::congestion_control::CongestionController;
+    use crate::connection::space::SentPacket;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
     use std::time::Duration;
@@ -801,6 +803,52 @@ mod tests {
         assert_eq!(path_mgr.get_active_mut()?.remote_addr(), server_addr);
         assert_eq!(path_mgr.get_active_path_id()?, 0);
 
+        Ok(())
+    }
+
+    /// Real review finding (MP_SQM_PLAN.md S2.4): the first `Brutal::
+    /// set_target_rate` implementation zeroed its rate outright on `None`,
+    /// so the exact call `set_scheduler_target_rate` makes to restore native
+    /// policy (`Path::set_scheduler_target_rate(None)`, e.g. once an MP
+    /// allocation stops covering this path) would leave a live Brutal path
+    /// stuck reporting a near-zero congestion window forever. Assert the
+    /// window stays well above the one-MTU floor after exactly that call.
+    #[test]
+    fn brutal_path_keeps_a_real_window_after_target_rate_is_cleared() -> Result<()> {
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9460);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 460);
+        let conf = RecoveryConfig {
+            congestion_control_algorithm: CongestionControlAlgorithm::Brutal,
+            brutal_bps: 1_000_000,
+            ..new_test_recovery_config()
+        };
+        let mut path = Path::new(client_addr, server_addr, true, &conf, "");
+        // Brutal reports a floor window before any RTT sample; give it one
+        // through the real `CongestionController::on_ack` path so the actual
+        // `bps * srtt * 2 / ack_rate` formula is exercised, not the no-RTT
+        // floor (which would trivially pass regardless of this bug).
+        let rtt_estimator = crate::connection::rtt::RttEstimator::new(Duration::from_millis(100));
+        let now = time::Instant::now();
+        let mut pkt = SentPacket {
+            ack_eliciting: true,
+            in_flight: true,
+            sent_size: 1200,
+            ..SentPacket::default()
+        };
+        path.recovery.congestion.on_sent(now, &mut pkt, 1200);
+        path.recovery.congestion.begin_ack(now, 1200);
+        path.recovery
+            .congestion
+            .on_ack(&mut pkt, now, false, &rtt_estimator, 0);
+
+        path.set_scheduler_target_rate(Some(3_000_000));
+        path.set_scheduler_target_rate(None);
+
+        let cwnd = path.recovery.congestion.congestion_window();
+        assert!(
+            cwnd > conf.max_datagram_size as u64,
+            "cwnd {cwnd} did not recover past one MTU after clearing the external target"
+        );
         Ok(())
     }
 
