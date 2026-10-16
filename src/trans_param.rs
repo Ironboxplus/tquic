@@ -121,6 +121,48 @@ pub struct TransportParams {
     /// completely trust the path between themselves.
     /// See draft-banks-quic-disable-encryption-00.
     pub disable_encryption: bool,
+
+    /// The maximum size of a DATAGRAM frame (including the frame type,
+    /// length, and payload) the endpoint is willing to receive, in bytes.
+    /// `None` means the parameter is absent and DATAGRAM frames must not be
+    /// sent to this endpoint. See RFC 9221.
+    pub max_datagram_frame_size: Option<u64>,
+
+    /// The address discovery mode: 0 = willing to provide observed
+    /// addresses, 1 = wants to receive them, 2 = both. `None` means the
+    /// extension is not supported. See draft-ietf-quic-address-discovery.
+    pub address_discovery: Option<u64>,
+}
+
+/// Transport parameter id of `max_datagram_frame_size` (RFC 9221).
+pub(crate) const TP_MAX_DATAGRAM_FRAME_SIZE: u64 = 0x0020;
+
+/// Transport parameter id of `address_discovery`.
+pub(crate) const TP_ADDRESS_DISCOVERY: u64 = 0x9f81a176;
+
+/// Address discovery modes carried in `address_discovery`.
+pub(crate) const ADDRESS_DISCOVERY_PROVIDE: u64 = 0;
+pub(crate) const ADDRESS_DISCOVERY_RECEIVE: u64 = 1;
+pub(crate) const ADDRESS_DISCOVERY_BOTH: u64 = 2;
+
+impl TransportParams {
+    /// Whether an endpoint advertising these parameters is willing to send
+    /// OBSERVED_ADDRESS frames.
+    pub(crate) fn address_discovery_provides(&self) -> bool {
+        matches!(
+            self.address_discovery,
+            Some(ADDRESS_DISCOVERY_PROVIDE) | Some(ADDRESS_DISCOVERY_BOTH)
+        )
+    }
+
+    /// Whether an endpoint advertising these parameters wants to receive
+    /// OBSERVED_ADDRESS frames.
+    pub(crate) fn address_discovery_receives(&self) -> bool {
+        matches!(
+            self.address_discovery,
+            Some(ADDRESS_DISCOVERY_RECEIVE) | Some(ADDRESS_DISCOVERY_BOTH)
+        )
+    }
 }
 
 impl TransportParams {
@@ -266,6 +308,18 @@ impl TransportParams {
                     tp.disable_encryption = true;
                 }
 
+                TP_MAX_DATAGRAM_FRAME_SIZE => {
+                    tp.max_datagram_frame_size = Some(val.read_varint()?);
+                }
+
+                TP_ADDRESS_DISCOVERY => {
+                    let mode = val.read_varint()?;
+                    if mode > ADDRESS_DISCOVERY_BOTH {
+                        return Err(Error::TransportParameterError);
+                    }
+                    tp.address_discovery = Some(mode);
+                }
+
                 // Ignore unknown parameters.
                 _ => (),
             }
@@ -404,6 +458,18 @@ impl TransportParams {
             buf.write_varint(0)?;
         }
 
+        if let Some(size) = tp.max_datagram_frame_size {
+            buf.write_varint(TP_MAX_DATAGRAM_FRAME_SIZE)?;
+            buf.write_varint(codec::encode_varint_len(size) as u64)?;
+            buf.write_varint(size)?;
+        }
+
+        if let Some(mode) = tp.address_discovery {
+            buf.write_varint(TP_ADDRESS_DISCOVERY)?;
+            buf.write_varint(codec::encode_varint_len(mode) as u64)?;
+            buf.write_varint(mode)?;
+        }
+
         Ok(len - buf.len())
     }
 
@@ -438,7 +504,7 @@ impl TransportParams {
             initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
             initial_max_streams_uni: Some(self.initial_max_streams_uni),
             preferred_address: None,
-            max_datagram_frame_size: None,
+            max_datagram_frame_size: self.max_datagram_frame_size,
             grease_quic_bit: None,
         }
     }
@@ -483,6 +549,9 @@ impl Default for TransportParams {
 
             enable_multipath: false,
             disable_encryption: false,
+
+            max_datagram_frame_size: None,
+            address_discovery: None,
         }
     }
 }
@@ -583,6 +652,8 @@ mod tests {
             retry_source_connection_id: None,
             enable_multipath: true,
             disable_encryption: false,
+            max_datagram_frame_size: Some(1472),
+            address_discovery: Some(ADDRESS_DISCOVERY_BOTH),
         };
 
         // encode on the client side
@@ -627,6 +698,8 @@ mod tests {
             retry_source_connection_id: Some(ConnectionId::random()),
             enable_multipath: false,
             disable_encryption: true,
+            max_datagram_frame_size: None,
+            address_discovery: Some(ADDRESS_DISCOVERY_PROVIDE),
         };
 
         // encode on the server side
@@ -638,6 +711,48 @@ mod tests {
         assert_eq!(tp, tp2);
         assert_eq!(len, len2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn datagram_and_address_discovery_absent_by_default() -> Result<()> {
+        let tp = TransportParams::default();
+        let mut raw_params = [0; 256];
+        let len = TransportParams::encode(&tp, false, &mut raw_params)?;
+        let (tp2, _) = TransportParams::decode(&raw_params[..len], true)?;
+        assert_eq!(tp2.max_datagram_frame_size, None);
+        assert_eq!(tp2.address_discovery, None);
+        assert!(!tp2.address_discovery_provides());
+        assert!(!tp2.address_discovery_receives());
+        Ok(())
+    }
+
+    #[test]
+    fn address_discovery_modes() {
+        let mut tp = TransportParams::default();
+        tp.address_discovery = Some(ADDRESS_DISCOVERY_PROVIDE);
+        assert!(tp.address_discovery_provides());
+        assert!(!tp.address_discovery_receives());
+        tp.address_discovery = Some(ADDRESS_DISCOVERY_RECEIVE);
+        assert!(!tp.address_discovery_provides());
+        assert!(tp.address_discovery_receives());
+        tp.address_discovery = Some(ADDRESS_DISCOVERY_BOTH);
+        assert!(tp.address_discovery_provides());
+        assert!(tp.address_discovery_receives());
+    }
+
+    #[test]
+    fn address_discovery_rejects_unknown_mode() -> Result<()> {
+        let mut raw_params = [0; 32];
+        let mut buf = &mut raw_params[..];
+        buf.write_varint(TP_ADDRESS_DISCOVERY)?;
+        buf.write_varint(1)?;
+        buf.write_varint(3)?;
+        let len = 32 - buf.len();
+        assert_eq!(
+            TransportParams::decode(&raw_params[..len], true),
+            Err(Error::TransportParameterError)
+        );
         Ok(())
     }
 

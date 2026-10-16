@@ -17,21 +17,34 @@
 //! Ported from Hysteria's `core/internal/congestion/brutal/brutal.go`: TQUIC
 //! has no equivalent, so this is a new module rather than a modification of
 //! an existing one. Unlike every other algorithm in this crate, Brutal does
-//! not infer a send rate from RTT/loss measurements -- it sends at a fixed,
-//! externally supplied rate (`bps`), self-compensating for measured loss by
-//! inflating its congestion window/pacing rate proportionally, unless that
-//! compensation is disabled. It is intended for links whose true capacity is
-//! already known out of band -- for the MP optimizer, that means the
-//! resource-graph max-flow allocation becomes each path's Brutal rate
-//! directly (`Path::set_scheduler_target_rate` -> `set_target_rate`), with no
-//! separate negotiation channel between the optimizer and the congestion
-//! controller.
+//! not infer a send rate from RTT/loss measurements -- it sends at an
+//! externally supplied rate, self-compensating for measured loss by inflating
+//! its congestion window/pacing rate proportionally, unless that compensation
+//! is disabled. The rate is the MP optimizer's resource-graph max-flow
+//! allocation for the path (`Path::set_scheduler_target_rate` ->
+//! `set_target_rate`), which follows the egress's autorate estimate; the
+//! configured `bps` (`up_mbps`) is only the rate before an allocation exists,
+//! as it is autorate's starting point. What bounds the rate from above is the
+//! egress budget the allocation is cut from (autorate within the user's
+//! static ceiling) and the peer's announced receive rate.
 //!
 //! Unlike the Go original, this does not own a pacer: TQUIC already has a
 //! single shared RFC 9002 pacer per path (`congestion_control::pacing::Pacer`,
 //! driven by `recovery.rs` from `congestion_window()`/`pacing_rate()`), so
 //! Brutal only needs to report the right numbers into that existing
 //! machinery instead of scheduling sends itself.
+//!
+//! Two TQUIC-side differences are compensated so the send gate matches the
+//! Go original exactly:
+//! - Hysteria's `CanSend` is `bytesInFlight <= cwnd`; TQUIC's
+//!   `Recovery::can_send` blocks at `bytes_in_flight >= congestion_window()`.
+//!   `congestion_window()` therefore reports Hysteria's window plus one byte.
+//!   This matters at the one-datagram floor (small RTT): with `<` only one
+//!   packet is ever in flight, the receiver holds its ACK for max_ack_delay,
+//!   and throughput collapses far below `bps`.
+//! - Hysteria's floor is the connection's current datagram size
+//!   (`SetMaxDatagramSize`); here it starts from `RecoveryConfig::
+//!   max_datagram_size` and follows `set_max_datagram_size`.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -76,12 +89,15 @@ struct PktInfo {
 /// Brutal Configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct BrutalConfig {
-    /// Fixed target send rate, in bytes/sec.
+    /// Send rate before any target is installed, in bytes/sec.
     pub bps: u64,
 
     /// Disable ack-rate loss compensation: when `true`, `ack_rate` stays
     /// pinned at `1.0` regardless of measured loss.
     pub disable_loss_compensation: bool,
+
+    /// Initial maximum datagram size, the window floor.
+    pub max_datagram_size: u64,
 }
 
 impl BrutalConfig {
@@ -89,6 +105,7 @@ impl BrutalConfig {
         Self {
             bps: conf.brutal_bps,
             disable_loss_compensation: conf.brutal_disable_loss_compensation,
+            max_datagram_size: conf.max_datagram_size as u64,
         }
     }
 }
@@ -98,6 +115,7 @@ impl Default for BrutalConfig {
         Self {
             bps: 0,
             disable_loss_compensation: false,
+            max_datagram_size: crate::DEFAULT_SEND_UDP_PAYLOAD_SIZE as u64,
         }
     }
 }
@@ -107,16 +125,12 @@ impl Default for BrutalConfig {
 /// rationale and TQUIC-specific adaptations.
 #[derive(Debug)]
 pub struct Brutal {
-    /// The fixed rate this path was configured with (`up_mbps`, converted to
-    /// bytes/sec), i.e. a hard ceiling. `set_target_rate` (an MP max-flow
-    /// allocation, or a peer's negotiated rx cap) can only lower the
-    /// *effective* rate below this -- see `effective_bps` -- never raise it
-    /// above it, so a generous allocation elsewhere can never push a path
-    /// past what the user actually configured.
-    configured_bps: u64,
+    /// The rate this path starts at (`up_mbps`, converted to bytes/sec), used
+    /// until `set_target_rate` installs one -- see `effective_bps`.
+    start_bps: u64,
 
     /// Last value passed to `set_target_rate`. `None` means "no external
-    /// target installed, use `configured_bps` natively" -- the same meaning
+    /// target installed, use `start_bps` natively" -- the same meaning
     /// `Path::set_scheduler_target_rate(None)` documents ("restores the
     /// scheduler's native congestion-control/RTT policy"). See
     /// `effective_bps` for how `Some(0)` is handled.
@@ -152,9 +166,9 @@ pub struct Brutal {
 impl Brutal {
     pub fn new(conf: BrutalConfig) -> Self {
         Self {
-            configured_bps: conf.bps,
+            start_bps: conf.bps,
             external_target: None,
-            max_datagram_size: crate::DEFAULT_SEND_UDP_PAYLOAD_SIZE as u64,
+            max_datagram_size: conf.max_datagram_size,
             ack_rate: 1.0,
             disable_loss_compensation: conf.disable_loss_compensation,
             slots: [PktInfo::default(); PKT_INFO_SLOT_COUNT],
@@ -164,9 +178,9 @@ impl Brutal {
         }
     }
 
-    /// The rate `congestion_window`/`pacing_rate` actually use: `configured_
-    /// bps` clamped down (never up) by whatever `set_target_rate` last
-    /// installed. `Some(0)` -- "exclude this path from scheduling" -- is
+    /// The rate `congestion_window`/`pacing_rate` actually use: whatever
+    /// `set_target_rate` last installed, else `start_bps`. `Some(0)` --
+    /// "exclude this path from scheduling" -- is
     /// handled by TQUIC's own `Path::active` flag (set by the same
     /// `set_scheduler_target_rate` call that reaches `set_target_rate`), so
     /// treating it as "no target" here (rather than actually zeroing the
@@ -174,9 +188,30 @@ impl Brutal {
     /// rate for a path that is merely paused, not gone.
     fn effective_bps(&self) -> u64 {
         match self.external_target {
-            Some(0) | None => self.configured_bps,
-            Some(target) => self.configured_bps.min(target),
+            Some(0) | None => self.start_bps,
+            Some(target) => target,
         }
+    }
+
+    /// The wire rate after loss compensation (`effective_bps / ack_rate`,
+    /// Hysteria's rule). An installed target is a goodput rate like
+    /// `start_bps` -- the allocator's share of the egress budget, capped
+    /// by the peer's announced receive rate, which is a goodput rate too --
+    /// so compensation applies on top of it. What bounds the wire is the
+    /// egress governor, and autorate backs the budget off if the compensated
+    /// rate bloats the link.
+    fn send_rate(&self) -> f64 {
+        self.effective_bps() as f64 / self.ack_rate
+    }
+
+    /// Hysteria's `GetCongestionWindow`: `bps * srtt * 2 / ack_rate`, at least
+    /// one datagram; 10240 bytes before any RTT sample.
+    fn hysteria_cwnd(&self) -> u64 {
+        if self.srtt.is_zero() {
+            return NO_RTT_CONGESTION_WINDOW;
+        }
+        let cwnd = (self.send_rate() * self.srtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER) as u64;
+        cwnd.max(self.max_datagram_size)
     }
 
     fn current_timestamp(&self, now: Instant) -> i64 {
@@ -298,17 +333,13 @@ impl CongestionController for Brutal {
     }
 
     fn congestion_window(&self) -> u64 {
-        if self.srtt.is_zero() {
-            return NO_RTT_CONGESTION_WINDOW.max(self.max_datagram_size);
-        }
-        let cwnd = (self.effective_bps() as f64 * self.srtt.as_secs_f64()
-            * CONGESTION_WINDOW_MULTIPLIER
-            / self.ack_rate) as u64;
-        cwnd.max(self.max_datagram_size)
+        // +1: TQUIC's `can_send` is `in_flight < window`, Hysteria's is
+        // `in_flight <= cwnd` (see the module doc).
+        self.hysteria_cwnd() + 1
     }
 
     fn pacing_rate(&self) -> Option<u64> {
-        Some((self.effective_bps() as f64 / self.ack_rate) as u64)
+        Some(self.send_rate() as u64)
     }
 
     fn initial_window(&self) -> u64 {
@@ -330,6 +361,10 @@ impl CongestionController for Brutal {
     fn set_target_rate(&mut self, bps: Option<u64>) {
         self.external_target = bps;
     }
+
+    fn set_max_datagram_size(&mut self, max_datagram_size: u64) {
+        self.max_datagram_size = max_datagram_size;
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +375,7 @@ mod tests {
         Brutal::new(BrutalConfig {
             bps,
             disable_loss_compensation,
+            ..BrutalConfig::default()
         })
     }
 
@@ -381,7 +417,7 @@ mod tests {
     fn congestion_window_uses_the_no_rtt_floor_before_any_ack() {
         let b = brutal(1_000_000, false);
         assert!(b.srtt.is_zero());
-        assert_eq!(b.congestion_window(), NO_RTT_CONGESTION_WINDOW);
+        assert_eq!(b.hysteria_cwnd(), NO_RTT_CONGESTION_WINDOW);
     }
 
     #[test]
@@ -391,7 +427,7 @@ mod tests {
         // No loss recorded yet: ack_rate stays at its initial 1.0.
         assert_eq!(b.ack_rate, 1.0);
         assert_eq!(
-            b.congestion_window(),
+            b.hysteria_cwnd(),
             (1_000_000.0_f64 * 0.1 * CONGESTION_WINDOW_MULTIPLIER) as u64
         );
         assert_eq!(b.pacing_rate(), Some(1_000_000));
@@ -400,7 +436,7 @@ mod tests {
         // samples) to check the formula's use of it in isolation.
         b.ack_rate = MIN_ACK_RATE;
         assert_eq!(
-            b.congestion_window(),
+            b.hysteria_cwnd(),
             (1_000_000.0_f64 * 0.1 * CONGESTION_WINDOW_MULTIPLIER / MIN_ACK_RATE) as u64
         );
         assert_eq!(b.pacing_rate(), Some((1_000_000.0_f64 / MIN_ACK_RATE) as u64));
@@ -410,7 +446,44 @@ mod tests {
     fn congestion_window_never_drops_below_one_datagram() {
         let mut b = brutal(1, false);
         b.srtt = Duration::from_millis(1);
-        assert_eq!(b.congestion_window(), b.max_datagram_size);
+        assert_eq!(b.hysteria_cwnd(), b.max_datagram_size);
+    }
+
+    /// TQUIC's `Recovery::can_send` blocks at `in_flight >= congestion_window()`,
+    /// Hysteria's `CanSend` at `in_flight > cwnd`. At the one-datagram floor
+    /// (8 Mbit/s over a ~0.1 ms loopback RTT) Hysteria still lets a second
+    /// packet out while one is in flight -- which is what makes the receiver
+    /// ACK immediately instead of after max_ack_delay. The reported window
+    /// must reproduce that gate exactly.
+    #[test]
+    fn send_gate_matches_hysteria_at_the_one_datagram_floor() {
+        let mut b = brutal(1_000_000, false);
+        b.set_max_datagram_size(1472);
+        b.srtt = Duration::from_micros(100);
+        let cwnd = b.hysteria_cwnd();
+        assert_eq!(cwnd, 1472, "floor is the current datagram size");
+        let tquic_can_send = |in_flight: u64| in_flight < b.congestion_window();
+        let hysteria_can_send = |in_flight: u64| in_flight <= cwnd;
+        for in_flight in [0, 1, 1471, 1472, 1473, 2944] {
+            assert_eq!(
+                tquic_can_send(in_flight),
+                hysteria_can_send(in_flight),
+                "in_flight={in_flight}"
+            );
+        }
+        assert!(tquic_can_send(1472), "a second datagram may follow the first");
+    }
+
+    #[test]
+    fn datagram_size_follows_the_config_and_later_updates() {
+        let b = Brutal::new(BrutalConfig::from(&RecoveryConfig {
+            max_datagram_size: 1350,
+            ..RecoveryConfig::default()
+        }));
+        assert_eq!(b.minimal_window(), 1350);
+        let mut b = b;
+        b.set_max_datagram_size(1452);
+        assert_eq!(b.minimal_window(), 1452);
     }
 
     #[test]
@@ -429,37 +502,49 @@ mod tests {
         assert_eq!(b.ack_rate, 1.0);
     }
 
-    /// `set_target_rate` can only lower the effective rate below `configured_
-    /// bps` -- never raise it. Ported from a real review finding: the first
-    /// implementation set `self.bps = bps.unwrap_or(0)` unconditionally, so
-    /// `set_target_rate(None)` (TQUIC's normal "clear the external target,
-    /// restore native policy" call, issued whenever an MP allocation stops
-    /// covering a path) zeroed Brutal's rate outright instead of restoring
-    /// the configured one, and a generous allocation could push a path's
-    /// rate above what the user actually configured.
+    /// The configured rate is where a path starts; an installed target
+    /// replaces it whether lower or higher (it is the allocation from the
+    /// egress's autorate estimate, which climbs past the start once the link
+    /// carries more), and `None` -- TQUIC's "clear the external target,
+    /// restore native policy" call -- goes back to the start, not to zero.
     #[test]
-    fn set_target_rate_clamps_down_from_configured_and_none_restores_it() {
+    fn an_installed_target_replaces_the_start_rate_and_none_restores_it() {
         let mut b = brutal(1_000_000, false);
-        assert_eq!(b.pacing_rate(), Some(1_000_000), "starts at configured_bps");
+        assert_eq!(b.pacing_rate(), Some(1_000_000), "starts at start_bps");
 
-        // A lower external target (e.g. a conservative MP allocation, or a
-        // peer's negotiated rx cap) takes effect.
         b.set_target_rate(Some(400_000));
         assert_eq!(b.pacing_rate(), Some(400_000));
 
-        // A *higher* external target than configured must be clamped down to
-        // configured_bps, never raise the path above what the user set.
         b.set_target_rate(Some(5_000_000));
         assert_eq!(
             b.pacing_rate(),
-            Some(1_000_000),
-            "external target above configured_bps must be clamped, not applied"
+            Some(5_000_000),
+            "a target above the start rate is the rate"
         );
 
-        // `None` -- "restore native policy" -- must restore configured_bps,
-        // not zero.
         b.set_target_rate(None);
         assert_eq!(b.pacing_rate(), Some(1_000_000));
+    }
+
+    /// An installed target is a goodput rate: loss compensation applies on
+    /// top of it exactly as on `start_bps` (Hysteria's rule).
+    #[test]
+    fn loss_compensation_applies_on_top_of_an_installed_target() {
+        let mut b = brutal(1_000_000, false);
+        b.srtt = Duration::from_millis(100);
+        b.ack_rate = MIN_ACK_RATE;
+        let compensated = |bps: f64| (bps / MIN_ACK_RATE) as u64;
+        assert_eq!(b.pacing_rate(), Some(compensated(1_000_000.0)));
+
+        b.set_target_rate(Some(600_000));
+        assert_eq!(b.pacing_rate(), Some(compensated(600_000.0)));
+        assert_eq!(
+            b.hysteria_cwnd(),
+            (600_000.0 / MIN_ACK_RATE * 0.1 * CONGESTION_WINDOW_MULTIPLIER) as u64
+        );
+
+        b.set_target_rate(Some(5_000_000));
+        assert_eq!(b.pacing_rate(), Some(compensated(5_000_000.0)));
     }
 
     /// `Some(0)` means "exclude this path" via TQUIC's own `Path::active`

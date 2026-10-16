@@ -44,10 +44,11 @@ impl MultipathScheduler for MinRttScheduler {
         streams: &mut StreamMap,
     ) -> Result<usize> {
         let mut best = None;
+        let held = paths.held_back();
 
         for (pid, path) in paths.iter_mut() {
             // Skip the path that is not ready for sending non-probing packets.
-            if !path.active() || !path.recovery.can_send() {
+            if !path.active() || !path.recovery.can_send() || held.applies(path) {
                 continue;
             }
 
@@ -97,6 +98,24 @@ mod tests {
 
         t.set_path_active(1, false)?;
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn minrtt_standby_path_only_takes_over_when_no_regular_path_is_left() -> Result<()> {
+        let mut t = MultipathTester::new()?;
+        t.add_path("127.0.0.1:443", "127.0.0.2:8443", 50)?;
+        t.add_path("127.0.0.1:443", "127.0.0.3:8443", 150)?;
+        t.set_path_active(0, false)?;
+        // The lower-RTT path is on standby: the slower regular one is used.
+        t.set_path_standby(1, true)?;
+
+        let mut s = MinRttScheduler {};
+        assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 2);
+
+        t.set_path_active(2, false)?;
+        assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 1);
 
         Ok(())
     }

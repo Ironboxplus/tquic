@@ -49,9 +49,10 @@ impl MultipathScheduler for RedundantScheduler {
         spaces: &mut PacketNumSpaceMap,
         streams: &mut StreamMap,
     ) -> Result<usize> {
+        let held = paths.held_back();
         for (pid, path) in paths.iter_mut() {
             // Skip the path that is not ready for sending non-probing packets.
-            if !path.active() || !path.recovery.can_send() {
+            if !path.active() || !path.recovery.can_send() || held.applies(path) {
                 continue;
             }
             return Ok(pid);
@@ -74,8 +75,9 @@ impl MultipathScheduler for RedundantScheduler {
         }
 
         // Reinject the frames to other active paths.
+        let held = paths.held_back();
         for (pid, path) in paths.iter() {
-            if pid == path_id || !path.active() {
+            if pid == path_id || !path.active() || held.applies(path) {
                 continue;
             }
             let space = match spaces.get_mut(path.space_id) {

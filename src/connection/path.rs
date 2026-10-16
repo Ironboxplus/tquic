@@ -40,6 +40,34 @@ pub(crate) const INITIAL_CHAL_TIMEOUT: u64 = 25;
 
 pub(crate) const MAX_PROBING_TIMEOUTS: usize = 8;
 
+/// Consecutive PTOs after which a validated path is backed off: data
+/// scheduling passes it over and its in-flight data moves to the other paths.
+/// Probes, ACKs and keep-alives still use it, and any ACK ends the back-off.
+/// PTOs only drive recovery; whether the path is dead is decided by time
+/// (the host's idle timeout on `PathStats::idle_time`), as in noq.
+pub(crate) const PATH_BACKOFF_PTO_COUNT: usize = 3;
+
+/// The kinds of active paths the multipath schedulers pass over, see
+/// `PathMap::held_back`.
+#[derive(Clone, Copy)]
+pub(crate) struct HeldBack {
+    standby: bool,
+    backed_off: bool,
+}
+
+impl HeldBack {
+    /// Whether the schedulers must pass over `path` for data.
+    pub(crate) fn applies(&self, path: &Path) -> bool {
+        (self.standby && path.standby()) || (self.backed_off && path.backed_off())
+    }
+
+    /// Whether `path` is passed over because it is backed off, as opposed
+    /// to standby: such a path then also carries no data in its probes.
+    pub(crate) fn applies_backed_off(&self, path: &Path) -> bool {
+        self.backed_off && path.backed_off()
+    }
+}
+
 pub(crate) const MAX_PATH_CHALS_RECV: usize = 8;
 
 pub(crate) const MIN_PATH_PROBE_SIZE: usize = 64;
@@ -72,6 +100,11 @@ pub struct Path {
     /// from non-probing data scheduling. A positive value is authoritative and
     /// must not be reweighted by the scheduler's latency/bandwidth knob.
     scheduler_target_rate: Option<u64>,
+
+    /// A backup path chosen by an external path optimizer: it carries data
+    /// only when no non-standby path is active (see `PathMap::held_back`).
+    /// Validation, acknowledgements and keep-alives are unaffected.
+    standby: bool,
 
     /// Loss recovery and congestion control.
     pub(crate) recovery: Recovery,
@@ -117,6 +150,29 @@ pub struct Path {
 
     /// Whether the path has been abandoned in MPQUIC mode.
     pub(super) is_abandon: bool,
+
+    /// When an abandoned path is discarded: 3 PTO after PATH_ABANDON was sent
+    /// or received, long enough for the peer's last packets and ACKs to land.
+    drain_deadline: Option<time::Instant>,
+
+    /// Identifies the path within the connection, never reused (a 4-tuple
+    /// opened again is a new path). The initial path is 0.
+    serial: u64,
+
+    /// When a packet last arrived on the path (creation time before that).
+    last_recv_time: time::Instant,
+
+    /// Whether the in-flight data was already handed to the other paths for
+    /// the current back-off; reset by the next ACK.
+    backoff_flushed: bool,
+
+    /// The peer address last reported to the peer in an OBSERVED_ADDRESS
+    /// frame on this path (draft-ietf-quic-address-discovery).
+    observed_addr_reported: Option<SocketAddr>,
+
+    /// Our address as reported by the peer on this path, with the sequence
+    /// number of the frame carrying it.
+    peer_observed_addr: Option<(u64, SocketAddr)>,
 }
 
 impl Path {
@@ -148,6 +204,7 @@ impl Path {
             peer_context: None,
             active: false,
             scheduler_target_rate: None,
+            standby: false,
             recovery: Recovery::new(conf),
             state,
             recv_chals: VecDeque::new(),
@@ -163,6 +220,12 @@ impl Path {
             trace_id: trace_id.to_string(),
             space_id: SpaceId::Data,
             is_abandon: false,
+            drain_deadline: None,
+            serial: 0,
+            last_recv_time: time::Instant::now(),
+            backoff_flushed: false,
+            observed_addr_reported: None,
+            peer_observed_addr: None,
         }
     }
 
@@ -375,6 +438,24 @@ impl Path {
         self.scheduler_target_rate
     }
 
+    /// Mark this path as a standby (backup) path, or a regular one again.
+    pub(crate) fn set_standby(&mut self, standby: bool) {
+        self.standby = standby;
+    }
+
+    /// Whether this path is a standby (backup) path.
+    pub fn standby(&self) -> bool {
+        self.standby
+    }
+
+    /// Whether ACKs for this path's packet number space may be sent on it.
+    /// A path the scheduler holds idle (target rate 0) keeps acknowledging
+    /// what the peer sends on it; otherwise the peer's packets there are never
+    /// acked and its data stalls behind PTO probes.
+    pub(crate) fn can_send_ack(&self) -> bool {
+        self.active || (self.validated() && !self.is_abandon)
+    }
+
     /// Mark this path as abandoned by the host.
     pub(crate) fn abandon(&mut self) {
         self.is_abandon = true;
@@ -382,16 +463,134 @@ impl Path {
         self.scheduler_target_rate = Some(0);
     }
 
+    /// PMTU black hole detection (RFC 8899 Section 4.3): large packets keep
+    /// getting lost while smaller ones sent after them are acknowledged and
+    /// none of the large ones is. Consecutive PTOs are no evidence: a PMTU
+    /// black hole still passes small packets (whose ACKs reset the PTO
+    /// count), while an outage or an overloaded path drops everything.
+    /// Falls back to the base PMTU and returns the new size.
+    pub(super) fn check_pmtu_black_hole(&mut self) -> Option<usize> {
+        if !self.recovery.take_pmtu_black_hole() || !self.dplpmtud.on_black_hole() {
+            return None;
+        }
+        let current = self.dplpmtud.get_current_size();
+        self.recovery.update_max_datagram_size(current, false);
+        Some(current)
+    }
+
+    /// Whether this path was abandoned, by the host or by the peer.
+    pub fn is_abandoned(&self) -> bool {
+        self.is_abandon
+    }
+
+    /// Whether the validated path is backed off: its PTOs keep firing, so
+    /// data scheduling passes it over (see `PATH_BACKOFF_PTO_COUNT`).
+    pub(crate) fn backed_off(&self) -> bool {
+        self.validated() && self.recovery.pto_count() >= PATH_BACKOFF_PTO_COUNT
+    }
+
+    /// Note that the in-flight data was handed over for this back-off.
+    /// Returns whether it is the first time.
+    pub(crate) fn mark_backoff_flushed(&mut self) -> bool {
+        !std::mem::replace(&mut self.backoff_flushed, true)
+    }
+
+    /// An ACK arrived: the back-off, if any, is over.
+    pub(crate) fn on_ack_progress(&mut self) {
+        if self.recovery.pto_count() == 0 {
+            self.backoff_flushed = false;
+        }
+    }
+
+    /// A packet arrived on the path.
+    pub(crate) fn on_packet_received(&mut self, now: time::Instant) {
+        self.last_recv_time = now;
+    }
+
+    /// Time since a packet last arrived on the path.
+    pub(crate) fn idle_time(&self, now: time::Instant) -> Duration {
+        now.saturating_duration_since(self.last_recv_time)
+    }
+
+    /// Start draining an abandoned path: it is discarded 3 PTO from `now`
+    /// (draft-ietf-quic-multipath, as in noq's `PathDrained`). No-op if the
+    /// path is not abandoned or already draining.
+    pub(crate) fn start_drain(&mut self, now: time::Instant, max_ack_delay: time::Duration) {
+        if self.is_abandon && self.drain_deadline.is_none() {
+            let pto = self.recovery.rtt.pto_base() + max_ack_delay;
+            self.drain_deadline = Some(now + 3 * pto);
+        }
+    }
+
+    /// When the abandoned path is to be discarded, once draining has started.
+    pub(crate) fn drain_deadline(&self) -> Option<time::Instant> {
+        self.drain_deadline
+    }
+
+    /// Identifies this path within the connection, see `PathLifecycleEvent`.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// Set the serial of a path about to be inserted.
+    pub(crate) fn set_serial(&mut self, serial: u64) {
+        self.serial = serial;
+    }
+
     /// Return whether the path is unused.
     fn unused(&self) -> bool {
         !self.active && self.dcid_seq.is_none()
     }
 
+    /// Whether the peer's current address still has to be reported to it.
+    pub(super) fn need_report_observed_addr(&self) -> bool {
+        self.validated() && self.observed_addr_reported != Some(self.remote_addr)
+    }
+
+    /// Record that the peer's current address was reported to it.
+    pub(super) fn on_observed_addr_reported(&mut self) {
+        self.observed_addr_reported = Some(self.remote_addr);
+    }
+
+    /// Report `addr` again if the frame carrying it was lost while it is
+    /// still the peer's address on this path.
+    pub(super) fn on_observed_addr_lost(&mut self, addr: SocketAddr) {
+        if self.observed_addr_reported == Some(addr) && self.remote_addr == addr {
+            self.observed_addr_reported = None;
+        }
+    }
+
+    /// Handle an OBSERVED_ADDRESS frame received on this path. Frames with
+    /// a sequence number not above the last processed one are ignored.
+    /// Return true if the observed address was updated.
+    pub(super) fn on_observed_addr_received(&mut self, seq_num: u64, addr: SocketAddr) -> bool {
+        if self
+            .peer_observed_addr
+            .is_some_and(|(last, _)| seq_num <= last)
+        {
+            return false;
+        }
+        self.peer_observed_addr = Some((seq_num, addr));
+        true
+    }
+
+    /// Name of the loss detection used on this path.
+    pub fn loss_detection_name(&self) -> &'static str {
+        self.recovery.loss_detection_name()
+    }
+
+    /// Our address on this path as reported by the peer.
+    pub fn observed_local_addr(&self) -> Option<SocketAddr> {
+        self.peer_observed_addr.map(|(_, addr)| addr)
+    }
+
     /// Update and return the latest statistics about the path
     pub fn stats(&mut self) -> &PathStats {
         self.recovery.stat_lazy_update();
+        self.recovery.stats.observed_local_addr = self.observed_local_addr();
         self.recovery.stats.scheduler_target_rate_valid = self.scheduler_target_rate.is_some();
         self.recovery.stats.scheduler_target_rate = self.scheduler_target_rate.unwrap_or_default();
+        self.recovery.stats.idle_time = self.idle_time(time::Instant::now()).as_micros() as u64;
         &self.recovery.stats
     }
 
@@ -538,12 +737,15 @@ impl PathMap {
 
     /// Insert a new path
     pub fn insert_path(&mut self, path: Path) -> Result<usize> {
-        // eliminate an unused path if the maximum paths limit is reached
+        // eliminate an unused path if the maximum paths limit is reached.
+        // Abandoned paths are not handled here: dropping one needs the
+        // connection (CIDs, packet number space), see
+        // `Connection::discard_drained_paths`, which runs before this.
         if self.paths.len() >= self.max_paths {
             let (pid_to_remove, _) = self
                 .paths
                 .iter()
-                .find(|(_, p)| p.unused()) // TODO: or failed path ?
+                .find(|(_, p)| p.unused())
                 .ok_or(Error::Done)?;
             let path = self.paths.remove(pid_to_remove);
             self.addrs.remove(&(path.local_addr, path.remote_addr));
@@ -558,6 +760,24 @@ impl PathMap {
         Ok(pid)
     }
 
+    /// Remove the path identified by `path_id`, freeing its slot and 4-tuple.
+    pub(crate) fn remove(&mut self, path_id: usize) -> Option<Path> {
+        if !self.paths.contains(path_id) {
+            return None;
+        }
+        let path = self.paths.remove(path_id);
+        let key = (path.local_addr, path.remote_addr);
+        if self.addrs.get(&key) == Some(&path_id) {
+            self.addrs.remove(&key);
+        }
+        Some(path)
+    }
+
+    /// Whether every slot is taken.
+    pub(crate) fn is_full(&self) -> bool {
+        self.paths.len() >= self.max_paths
+    }
+
     /// Return an immutable iterator over all existing paths.
     pub fn iter(&self) -> slab::Iter<Path> {
         self.paths.iter()
@@ -566,6 +786,23 @@ impl PathMap {
     /// Return a mutable iterator over all existing paths.
     pub fn iter_mut(&mut self) -> slab::IterMut<Path> {
         self.paths.iter_mut()
+    }
+
+    /// Which active paths the schedulers pass over for data.
+    ///
+    /// Standby paths are held back while some active path is not a standby
+    /// one (a full congestion window on it does not count as gone). Paths
+    /// backed off after repeated PTOs are held back while some other active
+    /// path is not backed off. Either takes over once nothing else is left.
+    pub(crate) fn held_back(&self) -> HeldBack {
+        let backed_off = self
+            .paths
+            .iter()
+            .any(|(_, path)| path.active() && !path.backed_off());
+        let standby = self.paths.iter().any(|(_, path)| {
+            path.active() && !path.standby() && !(backed_off && path.backed_off())
+        });
+        HeldBack { standby, backed_off }
     }
 
     /// Return the number of all paths
@@ -709,6 +946,50 @@ impl PathMap {
     /// Promote to multipath mode.
     pub fn enable_multipath(&mut self) {
         self.is_multipath = true;
+    }
+}
+
+#[cfg(test)]
+mod observed_address_tests {
+    use super::*;
+
+    fn path(validated: bool) -> Path {
+        let local: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let remote: SocketAddr = "198.51.100.9:443".parse().unwrap();
+        Path::new(local, remote, validated, &RecoveryConfig::default(), "test")
+    }
+
+    #[test]
+    fn report_waits_for_validation_and_happens_once() {
+        let mut p = path(false);
+        assert!(!p.need_report_observed_addr());
+        let mut p = path(true);
+        assert!(p.need_report_observed_addr());
+        p.on_observed_addr_reported();
+        assert!(!p.need_report_observed_addr());
+    }
+
+    #[test]
+    fn lost_report_is_resent_only_for_the_current_address() {
+        let mut p = path(true);
+        p.on_observed_addr_reported();
+        p.on_observed_addr_lost("198.51.100.9:1".parse().unwrap());
+        assert!(!p.need_report_observed_addr());
+        p.on_observed_addr_lost(p.remote_addr());
+        assert!(p.need_report_observed_addr());
+    }
+
+    #[test]
+    fn stale_sequence_numbers_are_ignored() {
+        let mut p = path(true);
+        let a: SocketAddr = "203.0.113.1:1000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.2:2000".parse().unwrap();
+        assert!(p.on_observed_addr_received(5, a));
+        assert!(!p.on_observed_addr_received(4, b));
+        assert!(!p.on_observed_addr_received(5, b));
+        assert_eq!(p.observed_local_addr(), Some(a));
+        assert!(p.on_observed_addr_received(6, b));
+        assert_eq!(p.stats().observed_local_addr, Some(b));
     }
 }
 

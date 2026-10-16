@@ -97,6 +97,22 @@ impl ConnectionIdDeque {
             .and_then(|i| self.queue.remove(i)))
     }
 
+    /// Remove and return the ConnectionIdItem with given sequence, if present.
+    fn take(&mut self, seq: u64) -> Option<ConnectionIdItem> {
+        let i = self.queue.iter().position(|cid| cid.seq == seq)?;
+        self.queue.remove(i)
+    }
+
+    /// Detach the items that belong to `path_id`, returning their sequences.
+    fn release_path(&mut self, path_id: usize) -> Vec<u64> {
+        let mut released = Vec::new();
+        for cid in self.queue.iter_mut().filter(|c| c.path_id == Some(path_id)) {
+            cid.path_id = None;
+            released.push(cid.seq);
+        }
+        released
+    }
+
     /// Remove all the cids whose seq is lower than the given `seq`
     fn remove_lower(&mut self, seq: u64, mut f: impl FnMut(&ConnectionIdItem)) {
         self.queue.retain(|cid| {
@@ -163,6 +179,10 @@ pub struct ConnectionIdMgr {
 
     /// Retired Destination Connection IDs that should be announced to the peer.
     dcids_to_retire: VecDeque<u64>,
+
+    /// Source CIDs whose path was discarded and which the peer has not
+    /// retired yet.
+    released_scids: Vec<u64>,
 }
 
 impl ConnectionIdMgr {
@@ -451,6 +471,7 @@ impl ConnectionIdMgr {
             return Err(Error::ProtocolViolation);
         }
 
+        self.released_scids.retain(|s| *s != seq);
         let pid = if let Some(e) = self.scids.remove(seq)? {
             // The sequence number specified in a RETIRE_CONNECTION_ID frame
             // MUST NOT refer to the Destination Connection ID field of the
@@ -486,6 +507,47 @@ impl ConnectionIdMgr {
         } else {
             self.dcids_to_retire.retain(|s| *s != seq);
         }
+    }
+
+    /// Whether we asked the peer to retire the Source CID `seq` (a
+    /// Retire Prior To above it): the peer then moves its paths off it.
+    pub fn scid_retiring(&self, seq: u64) -> bool {
+        seq < self.retire_prior_to
+    }
+
+    /// Retire the Destination CID `seq` on our own initiative (its path was
+    /// discarded): forget it and queue a RETIRE_CONNECTION_ID frame for it.
+    /// Returns the removed item.
+    pub fn retire_dcid(&mut self, seq: u64) -> Option<ConnectionIdItem> {
+        let item = self.dcids.take(seq)?;
+        if !self.dcids_to_retire.contains(&seq) {
+            self.dcids_to_retire.push_back(seq);
+        }
+        Some(item)
+    }
+
+    /// Detach every Source CID from the discarded path `path_id`. The peer
+    /// retires them with RETIRE_CONNECTION_ID; until then they must not point
+    /// at a path id the path map may hand out again.
+    pub fn release_path(&mut self, path_id: usize) {
+        let released = self.scids.release_path(path_id);
+        self.released_scids.extend(released);
+    }
+
+    /// Whether the Source CID `seq` served a path that was discarded since.
+    /// It is not a fresh CID for a new path: packets still addressed to it
+    /// are stragglers of the dropped path, until the peer retires it.
+    pub fn scid_released(&self, seq: u64) -> bool {
+        self.released_scids.contains(&seq)
+    }
+
+    /// Get a destination CID requiring to be retired, other than `except`
+    /// (the one the packet being written is addressed to).
+    pub fn next_dcid_to_retire_except(&self, except: Option<u64>) -> Option<u64> {
+        self.dcids_to_retire
+            .iter()
+            .copied()
+            .find(|seq| Some(*seq) != except)
     }
 
     /// Get a source CID requiring to be advertised to the peer through the

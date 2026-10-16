@@ -313,6 +313,36 @@ impl StreamMap {
         }
     }
 
+    /// Get the number of bytes written by the application but never sent yet
+    /// (retransmissions not included).
+    pub fn stream_unsent_bytes(&mut self, stream_id: u64) -> Option<u64> {
+        self.get_mut(stream_id)
+            .map(|stream| stream.send.write_off.saturating_sub(stream.send.unsent_off))
+    }
+
+    /// Bytes written to sendable streams and not yet sent on any path: what
+    /// ECF calls the connection's unscheduled send buffer.
+    pub fn unsent_bytes(&self) -> u64 {
+        self.sendable
+            .values()
+            .flat_map(|q| {
+                q.non_incremental
+                    .iter()
+                    .map(|id| id.0)
+                    .chain(q.incremental.iter().copied())
+            })
+            .filter_map(|id| self.streams.get(&id))
+            .map(|stream| stream.send.write_off.saturating_sub(stream.send.unsent_off))
+            .sum()
+    }
+
+    /// Get the number of bytes written by the application and not yet
+    /// acknowledged contiguously from the start of the stream.
+    pub fn stream_unacked_bytes(&mut self, stream_id: u64) -> Option<u64> {
+        self.get_mut(stream_id)
+            .map(|stream| stream.send.unacked_len as u64)
+    }
+
     /// Write data to the stream's send buffer.
     pub fn stream_write(&mut self, stream_id: u64, mut buf: Bytes, fin: bool) -> Result<usize> {
         // Peer initiated unidirectional streams are receive-only, so we can't write to them.
@@ -688,12 +718,17 @@ impl StreamMap {
                 }
 
                 // Update stream id for next bidirectional/unidirectional stream.
-                if bidi {
-                    self.next_stream_id_bidi = cmp::max(self.next_stream_id_bidi, id);
-                    self.next_stream_id_bidi = self.next_stream_id_bidi.saturating_add(4);
-                } else {
-                    self.next_stream_id_uni = cmp::max(self.next_stream_id_uni, id);
-                    self.next_stream_id_uni = self.next_stream_id_uni.saturating_add(4);
+                // Only a local stream moves it: the next ids are local ones,
+                // and a peer stream id (the other parity) would make every
+                // later `stream_bidi_new` return an id this end may not open.
+                if local {
+                    if bidi {
+                        self.next_stream_id_bidi = cmp::max(self.next_stream_id_bidi, id);
+                        self.next_stream_id_bidi = self.next_stream_id_bidi.saturating_add(4);
+                    } else {
+                        self.next_stream_id_uni = cmp::max(self.next_stream_id_uni, id);
+                        self.next_stream_id_uni = self.next_stream_id_uni.saturating_add(4);
+                    }
                 }
 
                 self.concurrency_control.remove_avail_id(id, self.is_server);

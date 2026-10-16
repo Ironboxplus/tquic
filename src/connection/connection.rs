@@ -20,6 +20,7 @@ use core::ops::Range;
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -32,6 +33,9 @@ use log::*;
 use strum::IntoEnumIterator;
 
 use self::cid::ConnectionIdItem;
+use self::datagrams::DatagramState;
+pub use self::datagrams::DatagramStats;
+pub use self::datagrams::SendDatagramError;
 use self::space::BufferFlags;
 use self::space::BufferType;
 use self::space::PacketNumSpace;
@@ -169,6 +173,32 @@ pub struct Connection {
 
     /// Unique trace id for debug logging
     trace_id: String,
+
+    /// Unreliable datagram queues (RFC 9221).
+    datagrams: DatagramState,
+
+    /// Bytes of received datagrams buffered for the application.
+    datagram_recv_buffer_size: usize,
+
+    /// Bytes of datagrams queued for sending.
+    datagram_send_buffer_size: usize,
+
+    /// Sequence number of the next OBSERVED_ADDRESS frame.
+    observed_addr_seq: u64,
+
+    /// PATH_ABANDON frames still to send, by the sequence number of the
+    /// DCID this endpoint used on the abandoned path.
+    pending_path_abandons: VecDeque<u64>,
+
+    /// Recent path abandon events (local and received), for the host to
+    /// log: this crate's `log` records do not reach every host's logger.
+    path_abandon_events: VecDeque<String>,
+
+    /// Path lifecycle events not yet taken by the host, oldest first.
+    path_events: VecDeque<crate::PathLifecycleEvent>,
+
+    /// Serial of the next path to be created (the initial path is 0).
+    next_path_serial: u64,
 }
 
 impl Connection {
@@ -280,7 +310,21 @@ impl Connection {
             #[cfg(feature = "qlog")]
             qlog: None,
             trace_id,
+            datagrams: DatagramState::default(),
+            datagram_recv_buffer_size: conf.datagram_recv_buffer_size,
+            datagram_send_buffer_size: conf.datagram_send_buffer_size,
+            observed_addr_seq: 0,
+            pending_path_abandons: VecDeque::new(),
+            path_abandon_events: VecDeque::new(),
+            path_events: VecDeque::new(),
+            next_path_serial: 1,
         };
+        conn.datagrams
+            .breaker
+            .set_enabled(conf.datagram_bypass_cwnd);
+        conn.datagrams
+            .breaker
+            .set_trips(conf.datagram_bypass_breaker);
 
         let write_method = conn.get_write_method();
         conn.tls_session.set_write_method(write_method);
@@ -644,6 +688,7 @@ impl Connection {
 
         // Process acknowledged frames.
         self.try_process_acked_frames();
+        self.try_process_lost_datagrams(now);
 
         // The peer may issue new connection ids. If there is any path waiting
         // for a dcid, try to allocate one for it.
@@ -679,10 +724,9 @@ impl Connection {
         // Update statistic metrics
         self.stats.recv_count += 1;
         self.stats.recv_bytes += read as u64;
-        self.paths
-            .get_mut(pid)?
-            .recovery
-            .stat_recv_event(1, read as u64);
+        let path = self.paths.get_mut(pid)?;
+        path.on_packet_received(now);
+        path.recovery.stat_recv_event(1, read as u64);
 
         // The successful use of Handshake packets indicates that no more
         // Initial packets need to be exchanged, as these keys can only be
@@ -766,6 +810,10 @@ impl Connection {
                 )?;
                 self.stats.lost_count += lost_pkts;
                 self.stats.lost_bytes += lost_bytes;
+                path.on_ack_progress();
+                if let Some(current) = path.check_pmtu_black_hole() {
+                    debug!("{} path {:?} PMTU black hole, MTU is {} now", self.trace_id, path, current);
+                }
 
                 // An endpoint MUST discard its Handshake keys when the TLS
                 // handshake is confirmed.
@@ -868,9 +916,11 @@ impl Connection {
                 };
 
                 if let Some(pid) = self.cids.retire_scid(seq_num, &hdr.dcid)? {
-                    let path = self.paths.get_mut(pid)?;
-                    if path.scid_seq == Some(seq_num) {
-                        path.scid_seq = None;
+                    // The path may be gone already: it drained on this end first.
+                    if let Ok(path) = self.paths.get_mut(pid) {
+                        if path.scid_seq == Some(seq_num) {
+                            path.scid_seq = None;
+                        }
                     }
                 }
             }
@@ -888,11 +938,32 @@ impl Connection {
                 }
             }
 
-            frame::Frame::PathAbandon {
-                dcid_seq_num,
-                error_code,
-                reason,
-            } => { // temparaily ignore
+            // The peer stopped using the path it reached us on with our CID
+            // `dcid_seq_num`; stop sending on it too, and move what is still
+            // in flight there to the other paths.
+            // The last path is never taken away by a PATH_ABANDON: a peer
+            // closing its last path closes the connection instead, so such a
+            // frame can only mean it named a path we never shared with it.
+            frame::Frame::PathAbandon { dcid_seq_num, .. } => {
+                let live = self.paths.iter().filter(|(_, p)| !p.is_abandoned()).count();
+                let pid = self
+                    .paths
+                    .iter()
+                    .find(|(_, p)| p.scid_seq == Some(dcid_seq_num) && !p.is_abandoned())
+                    .map(|(pid, _)| pid);
+                let event = format!(
+                    "recv PATH_ABANDON dcid_seq {} on path {} -> local path {:?} (live {})",
+                    dcid_seq_num, path_id, pid, live
+                );
+                self.record_path_abandon_event(event);
+                match pid {
+                    Some(pid) if live > 1 => self.abandon_path_by_id(pid, false)?,
+                    Some(pid) => debug!(
+                        "{} ignored PATH_ABANDON for its last path {}",
+                        self.trace_id, pid
+                    ),
+                    None => {}
+                }
             }
 
             frame::Frame::PathStatus {
@@ -900,6 +971,40 @@ impl Connection {
                 seq_num,
                 status,
             } => { // temparaily ignore
+            }
+
+            Frame::ObservedAddress { seq_num, addr } => {
+                // An endpoint that did not ask for address reports must not
+                // receive them. See draft-ietf-quic-address-discovery.
+                if !self.local_transport_params.address_discovery_receives() {
+                    return Err(Error::ProtocolViolation);
+                }
+                if self
+                    .paths
+                    .get_mut(path_id)?
+                    .on_observed_addr_received(seq_num, addr)
+                {
+                    debug!(
+                        "{} peer observed local address {} on path {}",
+                        self.trace_id, addr, path_id
+                    );
+                }
+            }
+
+            Frame::Datagram { data, .. } => {
+                // A DATAGRAM frame larger than the advertised limit, or any
+                // DATAGRAM frame when none was advertised, is a protocol
+                // violation. See RFC 9221 Section 3.
+                let max_frame_size = self
+                    .local_transport_params
+                    .max_datagram_frame_size
+                    .ok_or(Error::ProtocolViolation)?;
+                let frame_len = 1 + codec::encode_varint_len(data.len() as u64) + data.len();
+                if frame_len as u64 > max_frame_size {
+                    return Err(Error::ProtocolViolation);
+                }
+                self.datagrams
+                    .received(data, Some(self.datagram_recv_buffer_size))?;
             }
 
             Frame::NewToken { token } => {
@@ -1493,15 +1598,52 @@ impl Connection {
                         }
                     }
 
+                    Frame::Datagram { .. } => {
+                        self.datagrams.stats.acked += 1;
+                        self.datagrams.breaker.on_acked(1);
+                    }
+
                     _ => (),
                 }
             }
         }
     }
 
+    /// Take lost DATAGRAM frames out of every packet number space: they are
+    /// never retransmitted (RFC 9221 Section 5.2). They are only counted,
+    /// for the congestion window bypass circuit breaker.
+    fn try_process_lost_datagrams(&mut self, now: time::Instant) {
+        let mut lost = 0;
+        for (_, space) in self.spaces.iter_mut() {
+            space.lost.retain(|frame| {
+                let is_datagram = matches!(frame, Frame::Datagram { .. });
+                lost += u64::from(is_datagram);
+                !is_datagram
+            });
+        }
+        self.datagrams.stats.lost += lost;
+        self.datagrams.breaker.on_lost(lost);
+
+        let srtt = self
+            .paths
+            .get_active()
+            .map_or(crate::INITIAL_RTT, |p| p.recovery.rtt.smoothed_rtt());
+        if self.datagrams.breaker.on_tick(now, srtt) {
+            warn!(
+                "{} datagrams are back under the congestion window after sustained loss",
+                self.trace_id
+            );
+        }
+    }
+
     /// If any path doesn't has a DCID, try to allocate one for it.
     fn try_allocate_cids_from_peer(&mut self) {
-        let paths_no_dcid = self.paths.iter_mut().filter(|(_, p)| p.dcid_seq.is_none());
+        // An abandoned path will never carry data again; a CID handed to it
+        // would be lost to paths that can use it.
+        let paths_no_dcid = self
+            .paths
+            .iter_mut()
+            .filter(|(_, p)| p.dcid_seq.is_none() && !p.is_abandoned());
 
         for (pid, path) in paths_no_dcid {
             if self.cids.zero_length_dcid() {
@@ -1582,7 +1724,14 @@ impl Connection {
         self.process_all_lost_frames();
 
         // Select a path for sending a packet
-        let pid = self.select_send_path()?;
+        let pid = match self.select_send_path(sender) {
+            Ok(pid) => pid,
+            Err(Error::Done) => {
+                self.mark_paths_with_nothing_to_send(sender);
+                return Err(Error::Done);
+            }
+            Err(e) => return Err(e),
+        };
 
         // Limit bytes sent by path MTU limit and server send limit before address validation
         let mut left = cmp::min(out.len(), self.max_datagram_size(pid));
@@ -1614,6 +1763,7 @@ impl Connection {
             send_meta.contains_handshake |= packet_meta.contains_handshake;
             send_meta.contains_close |= packet_meta.contains_close;
             send_meta.contains_retransmission |= packet_meta.contains_retransmission;
+            send_meta.flow_hash = send_meta.flow_hash.or(packet_meta.flow_hash);
 
             left = left.saturating_sub(written);
             done = done.saturating_add(written);
@@ -1637,6 +1787,7 @@ impl Connection {
         }
 
         if done == 0 {
+            self.mark_paths_with_nothing_to_send(sender);
             return Err(Error::Done);
         }
 
@@ -1841,12 +1992,19 @@ impl Connection {
             payload_offset + payload_len
         };
 
-        let send_meta = Self::packet_send_meta(
+        let mut send_meta = Self::packet_send_meta(
             &write_status.frames,
             pkt_type,
             write_status.is_probe,
             write_status.contains_retransmission,
         );
+        if !write_status
+            .frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::Stream { .. }))
+        {
+            send_meta.flow_hash = write_status.datagram_flow.flatten();
+        }
         let sent_pkt = space::SentPacket {
             pkt_type,
             pkt_num,
@@ -2002,6 +2160,20 @@ impl Connection {
         // - Probe packets are allowed to temporarily exceed the congestion
         // window. (RFC 9002 Section 4.7)
         if !st.is_probe && !r.can_send() {
+            if pkt_type == PacketType::OneRTT && self.datagrams.has_outgoing() {
+                if self.datagrams.breaker.active() {
+                    return self.try_write_datagrams_bypassing_cwnd(
+                        buf, left, st, pkt_type, path_id, false,
+                    );
+                }
+                // A tripped breaker or a closed window holds the bulk, not
+                // the measurements of the path (`OutgoingDatagram::measurement`).
+                if self.datagrams.has_measurement() {
+                    return self.try_write_datagrams_bypassing_cwnd(
+                        buf, left, st, pkt_type, path_id, true,
+                    );
+                }
+            }
             return Err(Error::Done);
         }
         st.pacing = true;
@@ -2017,6 +2189,12 @@ impl Connection {
 
         // Write PATH_CHALLENGE/PATH_RESPONSE frames
         self.try_write_path_validation_frames(out, st, pkt_type, path_id)?;
+
+        // Write an OBSERVED_ADDRESS frame
+        self.try_write_observed_address_frame(out, st, pkt_type, path_id)?;
+
+        // Write PATH_ABANDON frames
+        self.try_write_path_abandon_frames(out, st, pkt_type, path_id)?;
 
         // Write NEW_CONNECTION_ID/RETRIE_CONNECTION_ID frames
         self.try_write_cid_control_frame(out, st, pkt_type, path_id)?;
@@ -2040,6 +2218,14 @@ impl Connection {
         // Write a CRYPTO frame
         self.try_write_crypto_frame(out, st, pkt_type, path_id)?;
 
+        // A path the schedulers hold back carries no data at all: a standby
+        // (backup) path while another path is available (draft-ietf-quic-
+        // multipath Section 3.3, PATH_STATUS_BACKUP; noq checks
+        // `may_send_data` before every data frame), and a backed-off path,
+        // whose data went to the other paths. It is still chosen to send its
+        // ACKs, PINGs and probes, which is how data leaked onto it before.
+        let held_back = self.paths.held_back().applies(self.paths.get(path_id)?);
+
         // Data gate: ask the sender whether it currently has budget for more
         // application-data bytes before writing STREAM frames -- fresh ones
         // below, and multipath buffered/retransmitted ones just above them.
@@ -2051,17 +2237,27 @@ impl Connection {
         // at the bottom of it, so a closed gate still produces a
         // control-only, ack-eliciting packet (PING) instead of Error::Done
         // -- see PacketSendHandler::can_send_data.
-        let data_gate_open = if pkt_type == PacketType::OneRTT || pkt_type == PacketType::ZeroRTT
-        {
-            let path = self.paths.get(path_id)?;
-            sender.can_send_data(
-                path.local_addr(),
-                path.remote_addr(),
-                path.recovery.max_datagram_size as usize,
-            )
-        } else {
-            true
-        };
+        let mut data_gate_open = !held_back && self.data_gate_open(sender, pkt_type, path_id)?;
+
+        // Write DATAGRAM frames. Under the bypass they go to the sender's
+        // queue whatever the data gate says: that queue is where they wait
+        // and are dropped (the WireGuard model, MP_FIX_PHASES.md S-I1), and
+        // the gate is for congestion-controlled data (S-I12). Otherwise they
+        // share the data gate, the congestion window and the pacer with
+        // STREAM frames.
+        if !held_back && (data_gate_open || self.datagrams.breaker.active()) {
+            self.try_write_datagram_frames(out, st, pkt_type, path_id, false)?;
+        } else if !held_back && self.datagrams.has_measurement() {
+            self.try_write_datagram_frames(out, st, pkt_type, path_id, true)?;
+        }
+
+        // A packet holding datagrams of an application flow carries nothing
+        // else, so that its flow is the packet's: a send queue below QUIC
+        // (`PacketSendMeta::flow_hash`) isolates flows by packet. The STREAM
+        // data waits for the next packet.
+        if matches!(st.datagram_flow, Some(Some(_))) {
+            data_gate_open = false;
+        }
 
         // Write buffered frames
         if data_gate_open {
@@ -2129,6 +2325,201 @@ impl Connection {
             st.in_flight = true
         }
 
+        Ok(())
+    }
+
+    /// Ask the sender whether application data may be written now.
+    fn data_gate_open(
+        &self,
+        sender: &dyn PacketSendHandler,
+        pkt_type: PacketType,
+        path_id: usize,
+    ) -> Result<bool> {
+        if pkt_type != PacketType::OneRTT && pkt_type != PacketType::ZeroRTT {
+            return Ok(true);
+        }
+        let path = self.paths.get(path_id)?;
+        Ok(sender.can_send_data(
+            path.local_addr(),
+            path.remote_addr(),
+            path.recovery.max_datagram_size,
+        ))
+    }
+
+    /// Write a packet of DATAGRAM frames while the congestion window or the
+    /// pacer holds the path (RFC 9484 Section 10.2). Datagrams wait and are
+    /// dropped in the sender's queue below QUIC, as WireGuard's packets wait
+    /// in the NIC's qdisc, not here (MP_FIX_PHASES.md S-I1); a path the
+    /// schedulers hold back still carries none.
+    fn try_write_datagrams_bypassing_cwnd(
+        &mut self,
+        buf: &mut [u8],
+        left: usize,
+        st: &mut FrameWriteStatus,
+        pkt_type: PacketType,
+        path_id: usize,
+        only_measurement: bool,
+    ) -> Result<()> {
+        if self.paths.held_back().applies(self.paths.get(path_id)?) {
+            return Err(Error::Done);
+        }
+        // Counted against the pacer, so the path's congestion-controlled
+        // data waits for the share the datagrams took.
+        st.pacing = true;
+
+        let out = &mut buf[..left];
+        self.try_write_datagram_frames(out, st, pkt_type, path_id, only_measurement)?;
+        if st.frames.is_empty() {
+            return Err(Error::Done);
+        }
+        if st.written < crate::MIN_PAYLOAD_LEN {
+            let frame = Frame::Paddings {
+                len: crate::MIN_PAYLOAD_LEN - st.written,
+            };
+            Connection::write_frame_to_packet(frame, out, st)?;
+            st.in_flight = true;
+        }
+        Ok(())
+    }
+
+    /// Populate DATAGRAM frames to packet payload buffer.
+    fn try_write_datagram_frames(
+        &mut self,
+        out: &mut [u8],
+        st: &mut FrameWriteStatus,
+        pkt_type: PacketType,
+        path_id: usize,
+        only_measurement: bool,
+    ) -> Result<()> {
+        if pkt_type != PacketType::OneRTT
+            || self.is_closing()
+            || !self.datagrams.has_outgoing()
+            || !self.paths.get(path_id)?.active()
+        {
+            return Ok(());
+        }
+
+        // Never keep a datagram queued that can no longer be sent.
+        if let Some(max) = self.dgram_max_writable_len() {
+            self.datagrams.drop_oversized(max);
+        }
+
+        // With several paths each flow's datagrams keep one path (S-I5/I6).
+        let now = time::Instant::now();
+        let flow_path = if self.flags.contains(EnableMultipath) {
+            Some(self.datagram_flow_paths(now))
+        } else {
+            None
+        };
+
+        loop {
+            let room = out.len() - st.written;
+            let d = match &flow_path {
+                Some(flow_path) => self.datagrams.pop_fitting_for_path(
+                    room,
+                    &mut st.datagram_flow,
+                    only_measurement,
+                    |flow| flow_path.get(&flow) == Some(&path_id),
+                ),
+                None => self.datagrams.pop_fitting_in_packet(
+                    room,
+                    &mut st.datagram_flow,
+                    only_measurement,
+                ),
+            };
+            let Some(d) = d else {
+                break;
+            };
+            self.datagrams.flow_paths.on_sent(d.flow, now);
+            let frame = Frame::Datagram { data: d.data };
+            st.written += frame.to_bytes(&mut out[st.written..])?;
+            // The payload is not kept: datagrams are never retransmitted,
+            // the frame is only counted when acknowledged or lost.
+            st.frames.push(Frame::Datagram { data: Bytes::new() });
+            st.ack_eliciting = true;
+            st.in_flight = true;
+        }
+        Ok(())
+    }
+
+    /// Whether this endpoint reports observed addresses to the peer.
+    fn observed_address_reporting(&self) -> bool {
+        self.flags.contains(AppliedPeerTransportParams)
+            && self.local_transport_params.address_discovery_provides()
+            && self.peer_transport_params.address_discovery_receives()
+    }
+
+    /// Populate an OBSERVED_ADDRESS frame to packet payload buffer if the
+    /// peer's address on the path has not been reported yet.
+    fn try_write_observed_address_frame(
+        &mut self,
+        out: &mut [u8],
+        st: &mut FrameWriteStatus,
+        pkt_type: PacketType,
+        path_id: usize,
+    ) -> Result<()> {
+        if pkt_type != PacketType::OneRTT
+            || self.is_closing()
+            || !self.observed_address_reporting()
+        {
+            return Ok(());
+        }
+        let path = self.paths.get(path_id)?;
+        if !path.need_report_observed_addr() {
+            return Ok(());
+        }
+
+        let frame = Frame::ObservedAddress {
+            seq_num: self.observed_addr_seq,
+            addr: path.remote_addr(),
+        };
+        Connection::write_frame_to_packet(frame, out, st)?;
+        st.ack_eliciting = true;
+        st.in_flight = true;
+        self.observed_addr_seq += 1;
+        self.paths.get_mut(path_id)?.on_observed_addr_reported();
+        Ok(())
+    }
+
+    /// Populate pending PATH_ABANDON frames, on any path still in use.
+    fn try_write_path_abandon_frames(
+        &mut self,
+        out: &mut [u8],
+        st: &mut FrameWriteStatus,
+        pkt_type: PacketType,
+        path_id: usize,
+    ) -> Result<()> {
+        if pkt_type != PacketType::OneRTT
+            || self.is_closing()
+            || self.pending_path_abandons.is_empty()
+            || !self.paths.get(path_id)?.active()
+        {
+            return Ok(());
+        }
+        while let Some(&dcid_seq_num) = self.pending_path_abandons.front() {
+            let frame = Frame::PathAbandon {
+                dcid_seq_num,
+                error_code: 0,
+                reason: Vec::new(),
+            };
+            if frame.wire_len() > out.len().saturating_sub(st.written) {
+                break;
+            }
+            Connection::write_frame_to_packet(frame, out, st)?;
+            st.ack_eliciting = true;
+            st.in_flight = true;
+            self.pending_path_abandons.pop_front();
+
+            // The path this frame is about drains from now on.
+            let pid = self
+                .paths
+                .iter()
+                .find(|(_, p)| p.dcid_seq == Some(dcid_seq_num) && p.is_abandoned())
+                .map(|(pid, _)| pid);
+            if let Some(pid) = pid {
+                self.start_path_drain(pid, time::Instant::now());
+            }
+        }
         Ok(())
     }
 
@@ -2230,7 +2621,7 @@ impl Connection {
         if space.recv_pkt_num_need_ack.is_empty()
             || !space.need_send_ack
             || is_closing
-            || !self.paths.get(path_id)?.active()
+            || !self.paths.get(path_id)?.can_send_ack()
         {
             return Ok(());
         }
@@ -2278,18 +2669,14 @@ impl Connection {
         }
 
         // Create RETIRE_CONNECTION_ID frames as needed.
-        while let Some(seq) = self.cids.next_dcid_to_retire() {
+        while let Some(seq) = self
+            .cids
+            .next_dcid_to_retire_except(self.paths.get(path_id)?.dcid_seq)
+        {
             // The sequence number specified in a RETIRE_CONNECTION_ID frame
             // MUST NOT refer to the Destination Connection ID field of the
-            // packet in which the frame is contained.
-            let dcid_seq = self
-                .paths
-                .get(path_id)?
-                .dcid_seq
-                .ok_or(Error::InternalError)?;
-            if seq == dcid_seq {
-                continue;
-            }
+            // packet in which the frame is contained: such a CID waits for a
+            // packet on another path.
 
             let frame = Frame::RetireConnectionId { seq_num: seq };
             Connection::write_frame_to_packet(frame, out, st)?;
@@ -2886,7 +3273,7 @@ impl Connection {
                 // Only application STREAM bytes consume the data allowance. QUIC
                 // CRYPTO frames carry handshake state and must remain eligible for
                 // the bounded control reserve while application data is paused.
-                Frame::Stream { .. } => meta.contains_data = true,
+                Frame::Stream { .. } | Frame::Datagram { .. } => meta.contains_data = true,
                 Frame::Crypto { .. } | Frame::HandshakeDone => meta.contains_handshake = true,
                 Frame::Ack { .. } => meta.contains_ack = true,
                 Frame::PathChallenge { .. } | Frame::PathResponse { .. } => {
@@ -2946,6 +3333,14 @@ impl Connection {
                     // lost.
                     Frame::RetireConnectionId { seq_num } => {
                         self.cids.mark_dcid_to_retire(seq_num, true);
+                    }
+
+                    // PATH_ABANDON is sent again if the packet carrying it
+                    // is lost.
+                    Frame::PathAbandon { dcid_seq_num, .. } => {
+                        if !self.pending_path_abandons.contains(&dcid_seq_num) {
+                            self.pending_path_abandons.push_back(dcid_seq_num);
+                        }
                     }
 
                     // NEW_TOKEN frames are retransmitted if the packet
@@ -3043,6 +3438,14 @@ impl Connection {
                         self.streams.on_max_streams_frame_lost(bidi, max);
                     }
 
+                    // An OBSERVED_ADDRESS frame is sent again if the address
+                    // it carries is still the peer's address on its path.
+                    Frame::ObservedAddress { addr, .. } => {
+                        for (_, path) in self.paths.iter_mut() {
+                            path.on_observed_addr_lost(addr);
+                        }
+                    }
+
                     // A PING frame contain no information, so lost PING frames
                     // do not require repair. However, if it indicates the loss
                     // of a PMTU probe, we will try to schedule a new probe.
@@ -3069,7 +3472,118 @@ impl Connection {
     ///
     /// The selected path should have a packet that can be sent out, unless none
     /// of the paths are feasible.
-    fn select_send_path(&mut self) -> Result<usize> {
+    /// `send` found nothing to write: every established path that the
+    /// congestion window, the pacer and the sender's data gate would still let
+    /// send is application-limited.
+    fn mark_paths_with_nothing_to_send(&mut self, sender: &dyn PacketSendHandler) {
+        if !self.is_established() {
+            return;
+        }
+        for (_, path) in self.paths.iter_mut() {
+            let gate_open = sender.can_send_data(
+                path.local_addr(),
+                path.remote_addr(),
+                path.recovery.max_datagram_size,
+            );
+            if gate_open {
+                path.recovery.on_nothing_to_send();
+            }
+        }
+    }
+
+    /// The largest difference in propagation delay between the paths a
+    /// datagram may take: a flow that paused longer than this can move to
+    /// another of them without its packets overtaking each other.
+    fn flowlet_gap(&self) -> time::Duration {
+        let held = self.paths.held_back();
+        let delays = self
+            .paths
+            .iter()
+            .filter(|(_, p)| {
+                p.active() && !held.applies(p) && p.scheduler_target_rate() != Some(0)
+            })
+            .map(|(_, p)| p.recovery.rtt.windowed_min_rtt());
+        let (lo, hi) = delays.fold((None, None), |(lo, hi), d| {
+            (
+                Some(lo.map_or(d, |lo: time::Duration| lo.min(d))),
+                Some(hi.map_or(d, |hi: time::Duration| hi.max(d))),
+            )
+        });
+        match (lo, hi) {
+            (Some(lo), Some(hi)) => hi - lo,
+            _ => time::Duration::ZERO,
+        }
+    }
+
+    /// The path of every flow with queued datagrams: the one it keeps, or,
+    /// at a flowlet boundary or when its path can no longer be used, the
+    /// one ECF places it on (`ecf_place`, S-I5/I6). A flow with no usable path
+    /// is left out and waits.
+    fn datagram_flow_paths(&mut self, now: time::Instant) -> HashMap<Option<u32>, usize> {
+        let gap = self.flowlet_gap();
+        let held = self.paths.held_back();
+        let mut placed = HashMap::new();
+        for i in 0..self.datagrams.outgoing_len() {
+            let Some(flow) = self.datagrams.flow_at(i) else {
+                break;
+            };
+            if placed.contains_key(&flow) {
+                continue;
+            }
+            let paths = &self.paths;
+            let usable = |pid: usize| {
+                paths.get(pid).is_ok_and(|p| {
+                    p.active() && !held.applies(p) && p.scheduler_target_rate() != Some(0)
+                })
+            };
+            let pid = match self.datagrams.flow_paths.current(flow, now, gap, usable) {
+                Some(pid) => pid,
+                None => match ecf_place(&mut self.paths, self.datagrams.outgoing_bytes() as u64) {
+                    Some(pid) => {
+                        self.datagrams.flow_paths.place(flow, pid, now);
+                        pid
+                    }
+                    None => continue,
+                },
+            };
+            placed.insert(flow, pid);
+        }
+        placed
+    }
+
+    /// A path that can send the oldest datagram of some flow now: under the
+    /// bypass any path a flow is on, otherwise one whose congestion window,
+    /// pacer and data gate allow it.
+    fn select_datagram_path(&mut self, sender: &dyn PacketSendHandler) -> Option<usize> {
+        if !self.is_established() || !self.datagrams.has_outgoing() {
+            return None;
+        }
+        let bypass = self.datagrams.breaker.active();
+        let flow_path = self.datagram_flow_paths(time::Instant::now());
+        let mut tried = Vec::new();
+        for i in 0..self.datagrams.outgoing_len() {
+            let Some(pid) = self.datagrams.flow_at(i).and_then(|flow| flow_path.get(&flow)) else {
+                continue;
+            };
+            if tried.contains(pid) {
+                continue;
+            }
+            tried.push(*pid);
+            if bypass || self.datagrams.is_measurement_at(i) {
+                return Some(*pid);
+            }
+            let can_send = self
+                .paths
+                .get_mut(*pid)
+                .is_ok_and(|p| p.recovery.can_send());
+            if can_send && self.data_gate_open(sender, PacketType::OneRTT, *pid).unwrap_or(false) {
+                return Some(*pid);
+            }
+        }
+        None
+    }
+
+    fn select_send_path(&mut self, sender: &dyn PacketSendHandler) -> Result<usize> {
         // Select an unvalidated path with path probing packets to send
         if self.is_established() {
             let mut probing = self
@@ -3086,6 +3600,26 @@ impl Connection {
 
         // Multipath scheduling for Multipath QUIC
         if self.flags.contains(EnableMultipath) {
+            // A backed-off path is passed over by the schedulers, but its PTO
+            // probes must still go out, or nothing would ever end the back-off.
+            let probing_backed_off = self
+                .paths
+                .iter()
+                .find(|(_, p)| {
+                    p.active()
+                        && p.backed_off()
+                        && self.spaces.get(p.space_id).is_some_and(|s| s.loss_probes > 0)
+                })
+                .map(|(pid, _)| pid);
+            if let Some(pid) = probing_backed_off {
+                return Ok(pid);
+            }
+
+            // Datagrams go on the path their flow keeps (S-I5/I6).
+            if let Some(pid) = self.select_datagram_path(sender) {
+                return Ok(pid);
+            }
+
             // Select a validated path with sufficient congestion window by the
             // multipath scheduler.
             if self.need_send_path_unaware_frames() {
@@ -3098,9 +3632,19 @@ impl Connection {
                 }
             }
 
-            // Select a validated path with ACK/PTO/Buffered packets to send.
+            // Select a validated path with ACK/PTO/Buffered packets or an
+            // address report to send.
+            let observed_address_reporting = self.observed_address_reporting();
             for (pid, path) in self.paths.iter_mut() {
                 if !path.active() {
+                    // An idle path still owes the peer ACKs for its space, and
+                    // keep-alive PINGs keep its NAT mappings open.
+                    let ack_due = self.spaces.get(path.space_id).is_some_and(|space| {
+                        !space.recv_pkt_num_need_ack.is_empty() && space.need_send_ack
+                    });
+                    if path.can_send_ack() && (ack_due || path.need_send_ping) {
+                        return Ok(pid);
+                    }
                     continue;
                 }
                 match self.spaces.get(path.space_id) {
@@ -3115,6 +3659,15 @@ impl Connection {
                             return Ok(pid);
                         }
                         if path.need_send_ping {
+                            return Ok(pid);
+                        }
+                        // The report is ack-eliciting: like buffered frames it
+                        // waits for congestion window, so a blocked path never
+                        // shadows another path's ACK.
+                        if observed_address_reporting
+                            && path.need_report_observed_addr()
+                            && path.recovery.can_send()
+                        {
                             return Ok(pid);
                         }
                         continue;
@@ -3217,8 +3770,11 @@ impl Connection {
                 || path.dplpmtud.should_probe()
                 || path.need_send_ping
                 || self.cids.need_send_cid_control_frames()
+                || !self.pending_path_abandons.is_empty()
                 || self.streams.need_send_stream_frames()
-                || self.spaces.need_send_buffered_frames())
+                || self.spaces.need_send_buffered_frames()
+                || self.datagrams.has_outgoing()
+                || (self.observed_address_reporting() && path.need_report_observed_addr()))
         {
             if !self.is_server && self.tls_session.is_in_early_data() {
                 return Ok(PacketType::ZeroRTT);
@@ -3235,7 +3791,9 @@ impl Connection {
             || self.need_send_new_token_frame()
             || self.local_error.as_ref().is_some_and(|e| e.is_app)
             || self.cids.need_send_cid_control_frames()
+            || !self.pending_path_abandons.is_empty()
             || self.streams.need_send_stream_frames()
+            || self.datagrams.has_outgoing()
     }
 
     /// Find space id for the specified packet type and path id.
@@ -3266,6 +3824,46 @@ impl Connection {
         // Note: If the incoming packet carrys an unknown dcid, just ignore and drop it.
         let (cid_seq, mut cid_pid) = self.cids.find_scid(dcid).ok_or(Error::Done)?;
 
+        // A straggler addressed to the CID of a path discarded here: it must
+        // neither open a path nor be taken for a new path on an open 4-tuple.
+        if self.cids.scid_released(cid_seq) {
+            return Err(Error::Done);
+        }
+
+        // A packet from the 4-tuple of an abandoned path, addressed to a CID
+        // other than that path's: the peer opened a new path on the same
+        // 4-tuple. Drop the old path and treat this as a new one. Packets
+        // still addressed to the old path's CID are its stragglers.
+        //
+        // The same holds for a path still open here when Multipath QUIC is
+        // negotiated: the new path's first packets can overtake the
+        // PATH_ABANDON for the old one, which travels on another path. In
+        // this CID-based multipath a path's packet number space and AEAD
+        // nonce are bound to its CID sequence (`space.add()` per CID in
+        // `add_path`, `cid_seq` in `decrypt_payload`), and the only reason to
+        // change a live path's CID is our own Retire Prior To (checked by
+        // `scid_retiring`). A different, unused CID without that is thus the
+        // peer opening a new path on this 4-tuple, i.e. having abandoned the
+        // old one: drop it without telling anyone, so the late PATH_ABANDON
+        // finds nothing to act on.
+        let mut recv_pid = recv_pid;
+        if let Some(pid) = recv_pid {
+            let multipath = self.flags.contains(EnableMultipath);
+            let stale = self.paths.get(pid).is_ok_and(|p| {
+                p.scid_seq != Some(cid_seq)
+                    && (p.is_abandoned()
+                        || (multipath
+                            && cid_pid.is_none()
+                            && p.scid_seq.is_some_and(|old| !self.cids.scid_retiring(old))))
+            });
+            if stale {
+                self.abandon_path_by_id(pid, false)?;
+                self.discard_path(pid, time::Instant::now());
+                recv_pid = None;
+                cid_pid = self.cids.find_scid(dcid).ok_or(Error::Done)?.1;
+            }
+        }
+
         // The incoming packet arrived on the existing path (for Client/Server).
         if let Some(recv_pid) = recv_pid {
             let recv_path = self.paths.get_mut(recv_pid)?;
@@ -3279,6 +3877,12 @@ impl Connection {
         }
 
         // The incoming packet arrived on a new path (for Server).
+        if self.paths.is_full() {
+            // Room comes from an abandoned path that has drained; that may
+            // be the one this CID was attached to.
+            self.discard_drained_paths(time::Instant::now());
+            cid_pid = self.cids.find_scid(dcid).ok_or(Error::Done)?.1;
+        }
         if self.cids.zero_length_scid() {
             cid_pid = None;
         }
@@ -3313,8 +3917,16 @@ impl Connection {
             }
         }
 
+        path.set_serial(self.next_path_serial);
+        self.next_path_serial += 1;
+        let (local, remote, serial) = (path.local_addr(), path.remote_addr(), path.serial());
         let pid = self.paths.insert_path(path)?;
         self.paths.get_mut(pid)?.update_trace_id(pid);
+        self.push_path_event(crate::PathLifecycleEvent::Opened {
+            local,
+            remote,
+            serial,
+        });
         if cid_pid.is_none() {
             self.cids.mark_scid_used(cid_seq, pid)?;
         }
@@ -3350,6 +3962,7 @@ impl Connection {
                 Some(time) => self.timers.set(Timer::Ack, time),
                 None => self.timers.stop(Timer::Ack),
             }
+            self.update_path_drain_timer();
 
             self.timers.next_timeout()
         };
@@ -3379,6 +3992,7 @@ impl Connection {
             self.timers.stop(timer);
             match timer {
                 Timer::LossDetection => {
+                    let mut backed_off_spaces = Vec::new();
                     for (_, path) in self.paths.iter_mut() {
                         if let Some(timer) = path.recovery.loss_detection_timer() {
                             if timer > now {
@@ -3395,6 +4009,18 @@ impl Connection {
                             self.stats.lost_count += lost_pkts;
                             self.stats.lost_bytes += lost_bytes;
 
+                            // Full-size packets stopped getting through (the
+                            // path MTU shrank): fall back to the base PMTU.
+                            if let Some(current) = path.check_pmtu_black_hole() {
+                                debug!("{} path {:?} PMTU black hole, MTU is {} now", self.trace_id, path, current);
+                            }
+
+                            // Repeated PTOs: the scheduler passes the path over
+                            // from now on, so what it holds moves to the others.
+                            if path.backed_off() && path.mark_backoff_flushed() {
+                                backed_off_spaces.push(path.space_id);
+                            }
+
                             // Write RecoveryMetricsUpdate event to qlog.
                             #[cfg(feature = "qlog")]
                             if let Some(qlog) = &mut self.qlog {
@@ -3402,6 +4028,10 @@ impl Connection {
                             }
                         }
                     }
+                    for space_id in backed_off_spaces {
+                        self.retransmit_path_inflight(space_id, now, false);
+                    }
+                    self.try_process_lost_datagrams(now);
                 }
 
                 Timer::Ack => {
@@ -3442,6 +4072,8 @@ impl Connection {
                 Timer::KeepAlive => (), // TODO: schedule an outgoing Ping
 
                 Timer::PathChallenge => self.paths.on_path_chal_timeout(now),
+
+                Timer::PathDrain => self.discard_drained_paths(now),
 
                 Timer::Handshake => {
                     info!("{} handshake timeout", self.trace_id);
@@ -3838,8 +4470,34 @@ impl Connection {
             return Err(Error::InvalidOperation("disallowed".into()));
         }
 
-        if self.paths.get_path_id(&(local_addr, remote_addr)).is_some() {
-            return Err(Error::Done);
+        if let Some(pid) = self.paths.get_path_id(&(local_addr, remote_addr)) {
+            let path = self.paths.get(pid)?;
+            // The path is open already.
+            if !path.is_abandoned() {
+                return Err(Error::Done);
+            }
+            // An abandoned path is never reused (noq opens a new path with a
+            // new path id; here a new CID and packet number space): drop it
+            // now rather than after its drain period, and open a new one on
+            // the same 4-tuple. Not before the peer was told, or it would
+            // see the new CID on a path it still believes open.
+            if path
+                .dcid_seq
+                .is_some_and(|seq| self.pending_path_abandons.contains(&seq))
+            {
+                return Err(Error::Done);
+            }
+            self.discard_path(pid, time::Instant::now());
+            // Its CID went back to the peer; the new path waits for the
+            // peer's replacement rather than opening without one.
+            if !self.cids.zero_length_dcid() && self.cids.lowest_unused_dcid_seq().is_none() {
+                return Err(Error::Done);
+            }
+        }
+
+        if self.paths.is_full() {
+            // Abandoned paths that have drained give their slots back.
+            self.discard_drained_paths(time::Instant::now());
         }
 
         let dcid_seq = if self.cids.zero_length_dcid() {
@@ -3856,8 +4514,16 @@ impl Connection {
             &self.trace_id,
         );
         path.dcid_seq = dcid_seq;
+        path.set_serial(self.next_path_serial);
+        self.next_path_serial += 1;
+        let (local, remote, serial) = (path.local_addr(), path.remote_addr(), path.serial());
         let pid = self.paths.insert_path(path)?;
         self.paths.get_mut(pid)?.update_trace_id(pid);
+        self.push_path_event(crate::PathLifecycleEvent::Opened {
+            local,
+            remote,
+            serial,
+        });
 
         if let Some(dcid_seq) = dcid_seq {
             self.cids.mark_dcid_used(dcid_seq, pid)?;
@@ -3887,13 +4553,220 @@ impl Connection {
             Some(pid) => pid,
             None => return Ok(()),
         };
+        self.abandon_path_by_id(pid, true)
+    }
 
-        // TODO: check number of active path
+    fn record_path_abandon_event(&mut self, event: String) {
+        if self.path_abandon_events.len() >= 16 {
+            self.path_abandon_events.pop_front();
+        }
+        self.path_abandon_events.push_back(event);
+    }
 
+    fn push_path_event(&mut self, event: crate::PathLifecycleEvent) {
+        // The host drains these every turn; the bound only guards against one
+        // that never does.
+        if self.path_events.len() >= 1024 {
+            self.path_events.pop_front();
+        }
+        self.path_events.push_back(event);
+    }
+
+    /// Path lifecycle events since the last call, oldest first. The host
+    /// decides from these what became of its paths instead of polling their
+    /// state, which a path can pass through unseen between two polls.
+    #[doc(hidden)]
+    pub fn take_path_events(&mut self) -> Vec<crate::PathLifecycleEvent> {
+        self.path_events.drain(..).collect()
+    }
+
+    /// Recent path abandon events since the last call, oldest first.
+    #[doc(hidden)]
+    pub fn take_path_abandon_events(&mut self) -> Vec<String> {
+        self.path_abandon_events.drain(..).collect()
+    }
+
+    /// Abandon path `pid`; with `notify`, tell the peer in a PATH_ABANDON
+    /// frame (sent on another path) so it stops sending there as well.
+    fn abandon_path_by_id(&mut self, pid: usize, notify: bool) -> Result<()> {
         // Mark the path as abandoned.
         let path = self.paths.get_mut(pid)?;
+        let newly_abandoned = !path.is_abandoned();
         path.abandon();
+        let space_id = path.space_id;
+        let lifecycle = newly_abandoned.then(|| crate::PathLifecycleEvent::Abandoned {
+            local: path.local_addr(),
+            remote: path.remote_addr(),
+            serial: path.serial(),
+            scid_seq: path.scid_seq,
+            dcid_seq: path.dcid_seq,
+            by_peer: !notify,
+        });
+        let event = format!(
+            "abandon path {} {:?}->{:?} notify {} new {} dcid_seq {:?} scid_seq {:?}",
+            pid,
+            path.local_addr(),
+            path.remote_addr(),
+            notify,
+            newly_abandoned,
+            path.dcid_seq,
+            path.scid_seq
+        );
+        let dcid_seq = path.dcid_seq;
+        self.record_path_abandon_event(event);
+        if let Some(lifecycle) = lifecycle {
+            self.push_path_event(lifecycle);
+        }
+        if notify && newly_abandoned {
+            if let Some(seq) = dcid_seq {
+                if !self.pending_path_abandons.contains(&seq) {
+                    self.pending_path_abandons.push_back(seq);
+                }
+            }
+        }
+
+        // Draining starts when the PATH_ABANDON goes out (see
+        // `try_write_path_abandon_frames`), or right away when there is none
+        // to send (the peer abandoned the path, or it has no CID).
+        let now = time::Instant::now();
+        let frame_pending =
+            dcid_seq.is_some_and(|seq| self.pending_path_abandons.contains(&seq));
+        if !frame_pending {
+            self.start_path_drain(pid, now);
+        }
+
+        self.retransmit_path_inflight(space_id, now, true);
         Ok(())
+    }
+
+    /// Everything still unacknowledged in `space_id` is handed to
+    /// retransmission now (it goes out on the other paths) instead of
+    /// trickling out one PTO probe at a time, which stalls every stream
+    /// behind the lost bytes.
+    ///
+    /// With `abandoned` the path is gone for good: its packets are marked
+    /// lost and every frame moves. Otherwise the path is only backed off and
+    /// may still deliver: packets stay as they are (their ACKs still count)
+    /// and only the stream data is queued again, a duplicate at worst.
+    fn retransmit_path_inflight(&mut self, space_id: SpaceId, now: time::Instant, abandoned: bool) {
+        if let Some(space) = self.spaces.get_mut(space_id) {
+            let mut lost = Vec::new();
+            for pkt in space
+                .sent
+                .iter_mut()
+                .filter(|p| p.time_acked.is_none() && p.time_lost.is_none())
+            {
+                if abandoned {
+                    pkt.time_lost = Some(now);
+                }
+                lost.extend(
+                    pkt.frames
+                        .iter()
+                        .filter(|f| match f {
+                            frame::Frame::Datagram { .. } => false,
+                            frame::Frame::Stream { .. } => true,
+                            _ => abandoned,
+                        })
+                        .cloned(),
+                );
+            }
+            space.lost.extend(lost);
+        }
+    }
+
+    /// Start the drain period of the abandoned path `pid` (3 PTO, as in
+    /// noq's `PathDrained` timer) and arm the timer that ends it.
+    fn start_path_drain(&mut self, pid: usize, now: time::Instant) {
+        let max_ack_delay = time::Duration::from_millis(self.peer_transport_params.max_ack_delay);
+        if let Ok(path) = self.paths.get_mut(pid) {
+            path.start_drain(now, max_ack_delay);
+        }
+        self.update_path_drain_timer();
+    }
+
+    /// Point `Timer::PathDrain` at the earliest drain deadline, if any.
+    fn update_path_drain_timer(&mut self) {
+        match self.paths.iter().filter_map(|(_, p)| p.drain_deadline()).min() {
+            Some(time) => self.timers.set(Timer::PathDrain, time),
+            None => self.timers.stop(Timer::PathDrain),
+        }
+    }
+
+    /// Discard every abandoned path whose drain period is over.
+    fn discard_drained_paths(&mut self, now: time::Instant) {
+        let drained: Vec<usize> = self
+            .paths
+            .iter()
+            .filter(|(_, p)| p.drain_deadline().is_some_and(|t| t <= now))
+            .map(|(pid, _)| pid)
+            .collect();
+        for pid in drained {
+            self.discard_path(pid, now);
+        }
+        self.update_path_drain_timer();
+    }
+
+    /// Drop the abandoned path `pid` and give back what it held: in-flight
+    /// frames go to retransmission, its Destination CID is retired (the peer
+    /// answers by retiring the matching Source CID, which the endpoint then
+    /// replaces), its slot and packet number space are freed. Same steps as
+    /// noq's `discard_path` after `PathDrained`.
+    ///
+    /// Unlike noq the last remaining path is never abandoned by the callers
+    /// (ET rebuilds the whole session instead of relying on a 3 PTO grace
+    /// period), so this never leaves the connection without a path.
+    fn discard_path(&mut self, pid: usize, now: time::Instant) {
+        let Ok(path) = self.paths.get(pid) else {
+            return;
+        };
+        let (space_id, dcid_seq, scid_seq, serial) =
+            (path.space_id, path.dcid_seq, path.scid_seq, path.serial());
+        let (local_addr, remote_addr) = (path.local_addr(), path.remote_addr());
+        let event = format!(
+            "discard path {} {:?}->{:?} dcid_seq {:?} scid_seq {:?}",
+            pid,
+            path.local_addr(),
+            path.remote_addr(),
+            dcid_seq,
+            path.scid_seq
+        );
+        self.record_path_abandon_event(event);
+        self.push_path_event(crate::PathLifecycleEvent::Discarded {
+            local: local_addr,
+            remote: remote_addr,
+            serial,
+            scid_seq,
+            dcid_seq,
+        });
+
+        self.retransmit_path_inflight(space_id, now, true);
+
+        if let Some(seq) = dcid_seq {
+            if !self.cids.zero_length_dcid() {
+                if let Some(item) = self.cids.retire_dcid(seq) {
+                    if let Some(token) = item.reset_token {
+                        self.events
+                            .add(Event::DcidRetired(ResetToken(token.to_be_bytes())));
+                    }
+                }
+            }
+        }
+        self.cids.release_path(pid);
+        self.paths.remove(pid);
+
+        // The packet number space goes with the path, unless a NAT-rebound
+        // path still shares it. What its ACKs and losses would have told the
+        // streams is applied first.
+        if matches!(space_id, SpaceId::DataExt(_))
+            && !self.paths.iter().any(|(_, p)| p.space_id == space_id)
+        {
+            self.process_all_lost_frames();
+            self.try_process_acked_frames();
+            self.spaces.drop(space_id);
+        }
+        // Connection-level counters (`self.stats`) are not derived from the
+        // paths, so nothing needs folding in as noq's `partial_stats` does.
+        self.mark_tickable(true);
     }
 
     /// Return an immutable reference to the specified path
@@ -3947,19 +4820,32 @@ impl Connection {
         Ok(())
     }
 
+    /// Mark a path as standby: it carries no data while another active
+    /// path is not on standby, however full that path's window is, and
+    /// takes over once none is left. Validation and recovery are unaffected.
+    pub fn set_path_standby(
+        &mut self,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        standby: bool,
+    ) -> Result<()> {
+        let pid = self
+            .paths
+            .get_path_id(&(local_addr, remote_addr))
+            .ok_or(Error::InvalidOperation("not found".into()))?;
+        self.paths.get_mut(pid)?.set_standby(standby);
+        self.mark_tickable(true);
+        Ok(())
+    }
+
     /// Replace the live multipath packet scheduler without rebuilding the
     /// connection. Existing path validation, recovery and congestion-control
     /// state are preserved.
-    pub fn set_multipath_scheduler(
-        &mut self,
-        algorithm: MultipathAlgorithm,
-        sqm_lambda: f64,
-    ) -> Result<()> {
+    pub fn set_multipath_scheduler(&mut self, algorithm: MultipathAlgorithm) -> Result<()> {
         if !self.flags.contains(EnableMultipath) {
             return Err(Error::InvalidOperation("multipath is disabled".into()));
         }
         self.multipath_conf.multipath_algorithm = algorithm;
-        self.multipath_conf.sqm_lambda = sqm_lambda.clamp(0.0, 1.0);
         self.multipath_scheduler = Some(build_multipath_scheduler(&self.multipath_conf));
         self.mark_tickable(true);
         Ok(())
@@ -3986,6 +4872,170 @@ impl Connection {
                 })
                 .collect(),
         }
+    }
+
+    /// Queue an unreliable datagram (RFC 9221) for sending.
+    ///
+    /// If `drop_oldest` is true, older unsent datagrams are discarded when
+    /// the send queue is full; otherwise `SendDatagramError::Blocked` hands
+    /// the datagram back.
+    pub fn dgram_send(
+        &mut self,
+        data: Bytes,
+        drop_oldest: bool,
+    ) -> std::result::Result<(), SendDatagramError> {
+        if self.local_transport_params.max_datagram_frame_size.is_none() {
+            return Err(SendDatagramError::Disabled);
+        }
+        let max = self
+            .dgram_max_writable_len()
+            .ok_or(SendDatagramError::UnsupportedByPeer)?;
+        if data.len() > max {
+            return Err(SendDatagramError::TooLarge);
+        }
+        self.datagrams
+            .queue(data, drop_oldest, self.datagram_send_buffer_size)?;
+        self.mark_tickable(true);
+        Ok(())
+    }
+
+    /// Queue an unreliable datagram that belongs to the application flow
+    /// `flow` (a hash of the flow's identity, the same for all its packets).
+    ///
+    /// A packet carries datagrams of one flow only, and reports the flow in
+    /// `PacketSendMeta::flow_hash`, so that a send queue below QUIC can keep
+    /// the flows apart even though they share one outer 4-tuple.
+    pub fn dgram_send_with_flow(
+        &mut self,
+        data: Bytes,
+        drop_oldest: bool,
+        flow: u32,
+    ) -> std::result::Result<(), SendDatagramError> {
+        if self.local_transport_params.max_datagram_frame_size.is_none() {
+            return Err(SendDatagramError::Disabled);
+        }
+        let max = self
+            .dgram_max_writable_len()
+            .ok_or(SendDatagramError::UnsupportedByPeer)?;
+        if data.len() > max {
+            return Err(SendDatagramError::TooLarge);
+        }
+        self.datagrams
+            .queue_with_flow(data, Some(flow), drop_oldest, self.datagram_send_buffer_size)?;
+        self.mark_tickable(true);
+        Ok(())
+    }
+
+    /// Queue a measurement datagram of the path itself (a delay probe or its
+    /// report; `flow` as for `dgram_send_with_flow`, `None` when it belongs to
+    /// none). Unlike application data it is not held back by the congestion
+    /// window, the data gate or a tripped bypass breaker.
+    pub fn dgram_send_measurement(
+        &mut self,
+        data: Bytes,
+        drop_oldest: bool,
+        flow: Option<u32>,
+    ) -> std::result::Result<(), SendDatagramError> {
+        if self.local_transport_params.max_datagram_frame_size.is_none() {
+            return Err(SendDatagramError::Disabled);
+        }
+        let max = self
+            .dgram_max_writable_len()
+            .ok_or(SendDatagramError::UnsupportedByPeer)?;
+        if data.len() > max {
+            return Err(SendDatagramError::TooLarge);
+        }
+        self.datagrams
+            .queue_measurement(data, flow, drop_oldest, self.datagram_send_buffer_size)?;
+        self.mark_tickable(true);
+        Ok(())
+    }
+
+    /// Receive an unreliable datagram.
+    pub fn dgram_recv(&mut self) -> Option<Bytes> {
+        self.datagrams.recv()
+    }
+
+    /// Return the largest datagram payload `dgram_send` currently accepts,
+    /// or `None` if datagrams are disabled locally or not supported by the
+    /// peer.
+    ///
+    /// It is the smaller of the peer's `max_datagram_frame_size` and the
+    /// smallest path MTU of the active paths, both less the frame header;
+    /// the latter also less the 1-RTT packet overhead. It grows as DPLPMTUD
+    /// raises the path MTU.
+    pub fn dgram_max_writable_len(&self) -> Option<usize> {
+        self.local_transport_params.max_datagram_frame_size?;
+        if !self.flags.contains(AppliedPeerTransportParams) {
+            return None;
+        }
+        let peer_max = self.peer_transport_params.max_datagram_frame_size?;
+
+        let mtu = self
+            .paths
+            .iter()
+            .filter(|(_, p)| p.active())
+            .map(|(pid, _)| self.max_datagram_size(pid))
+            .min()
+            .or_else(|| {
+                self.paths
+                    .get_active_path_id()
+                    .ok()
+                    .map(|pid| self.max_datagram_size(pid))
+            })?;
+        let by_path = mtu
+            .saturating_sub(self.short_packet_overhead())
+            .saturating_sub(frame::MAX_DATAGRAM_OVERHEAD);
+        let by_peer = (peer_max as usize).saturating_sub(frame::MAX_DATAGRAM_OVERHEAD);
+        Some(cmp::min(by_path, by_peer))
+    }
+
+    /// Upper bound of the 1-RTT packet overhead: header, packet number and
+    /// AEAD tag.
+    fn short_packet_overhead(&self) -> usize {
+        let dcid_len = self
+            .paths
+            .get_active()
+            .ok()
+            .and_then(|p| p.dcid_seq)
+            .and_then(|seq| self.cids.get_dcid(seq).ok())
+            .map_or(crate::MAX_CID_LEN, |c| c.cid.len());
+        let tag_len = self.tls_session.get_overhead(Level::OneRTT).unwrap_or(16);
+        1 + dcid_len + 4 + tag_len
+    }
+
+    /// Return the number of datagrams waiting to be sent.
+    pub fn dgram_send_queue_len(&self) -> usize {
+        self.datagrams.outgoing_len()
+    }
+
+    /// Return the bytes of datagrams waiting to be sent.
+    pub fn dgram_send_queue_bytes(&self) -> usize {
+        self.datagrams.outgoing_bytes()
+    }
+
+    /// Return the number of received datagrams not yet read.
+    pub fn dgram_recv_queue_len(&self) -> usize {
+        self.datagrams.incoming_len()
+    }
+
+    /// Return cumulative datagram counters.
+    pub fn dgram_stats(&self) -> DatagramStats {
+        self.datagrams.snapshot_stats()
+    }
+
+    /// Let datagrams exceed the congestion window, or stop doing so.
+    /// Enabling it again re-arms a tripped circuit breaker.
+    pub fn dgram_set_bypass_cwnd(&mut self, v: bool) {
+        self.datagrams.breaker.set_enabled(v);
+        self.mark_tickable(true);
+    }
+
+    /// Let the bypass's circuit breaker (RFC 8084) trip, or never: see
+    /// `Config::enable_datagram_bypass_breaker`.
+    pub fn dgram_set_bypass_breaker(&mut self, v: bool) {
+        self.datagrams.breaker.set_trips(v);
+        self.mark_tickable(true);
     }
 
     /// Return an iterator over streams that have data to read or an error to collect.
@@ -4108,6 +5158,21 @@ impl Connection {
             .stream_set_priority(stream_id, urgency, incremental)
     }
 
+    /// Return the number of bytes written to the stream that have never been
+    /// sent (retransmissions not included), or `None` for an unknown stream.
+    /// Lets an application keep its own queue in front of the stream instead
+    /// of parking a whole flow-control window of data inside it.
+    pub fn stream_unsent_bytes(&mut self, stream_id: u64) -> Option<u64> {
+        self.streams.stream_unsent_bytes(stream_id)
+    }
+
+    /// Return the number of bytes written to the stream that the peer has
+    /// not yet acknowledged in order, or `None` for an unknown (e.g. already
+    /// collected) stream. Zero means everything written has arrived.
+    pub fn stream_unacked_bytes(&mut self, stream_id: u64) -> Option<u64> {
+        self.streams.stream_unacked_bytes(stream_id)
+    }
+
     /// Return the stream's send capacity in bytes.
     pub fn stream_capacity(&self, stream_id: u64) -> Result<usize> {
         self.streams.stream_capacity(stream_id)
@@ -4203,7 +5268,13 @@ impl Connection {
             || !self.streams.events.is_empty()
             || self.streams.has_readable()
             || self.streams.has_writable()
+            || self.datagrams.readable_pending
             || self.is_closed()
+    }
+
+    /// Return true once after new datagrams became readable.
+    pub(crate) fn take_datagram_readable(&mut self) -> bool {
+        std::mem::take(&mut self.datagrams.readable_pending)
     }
 
     /// Check whether the connection is tickable (i.e. on the tickable queue
@@ -4685,6 +5756,10 @@ struct FrameWriteStatus {
     /// multipath buffered copies, which are replication/scheduling state and
     /// not loss recovery.
     contains_retransmission: bool,
+
+    /// The flow of the DATAGRAM frames written so far (`None` while there are
+    /// none; `Some(None)` for datagrams without a flow).
+    datagram_flow: Option<Option<u32>>,
 }
 
 /// Handshake status for loss recovery
@@ -7043,6 +8118,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stream_unacked_bytes_cover_written_until_acked() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        assert_eq!(test_pair.handshake(), Ok(()));
+        test_pair.move_forward()?;
+
+        let sid = test_pair.client.stream_bidi_new(0, false)?;
+        assert_eq!(test_pair.client.stream_unacked_bytes(sid), Some(0));
+        test_pair.client.stream_write(sid, Bytes::from_static(b"QUIC"), false)?;
+        // Written, not even sent.
+        assert_eq!(test_pair.client.stream_unacked_bytes(sid), Some(4));
+
+        // Sent but lost: still unacknowledged.
+        let _lost = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert_eq!(test_pair.client.stream_unacked_bytes(sid), Some(4));
+        test_pair.client.stream_write(sid, Bytes::from_static(b"DATA"), false)?;
+        assert_eq!(test_pair.client.stream_unacked_bytes(sid), Some(8));
+
+        // The second chunk arrives and is acknowledged; the first is still
+        // missing, so nothing is acknowledged in order yet.
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        assert_eq!(test_pair.client.stream_unacked_bytes(sid), Some(8));
+
+        // Recovery resends the first chunk (declared lost right away by the
+        // time threshold, or on the loss timer); once acknowledged, all is.
+        for _ in 0..10 {
+            if test_pair.client.stream_unacked_bytes(sid) == Some(0) {
+                break;
+            }
+            // `timeout()` brings the paths' loss timers into `timers`.
+            if test_pair.client.timeout().is_some() {
+                if let Some(now) = test_pair.client.timers.get(Timer::LossDetection) {
+                    test_pair.client.on_timeout(now);
+                }
+            }
+            test_pair.move_forward()?;
+        }
+        assert_eq!(test_pair.client.stream_unacked_bytes(sid), Some(0));
+        assert_eq!(test_pair.client.stream_unacked_bytes(sid + 4), None);
+        Ok(())
+    }
+
+    #[test]
     fn ack_data_space_ack_timeout() -> Result<()> {
         let mut client_config = TestPair::new_test_config(false)?;
         client_config.set_ack_eliciting_threshold(4);
@@ -7509,6 +8629,45 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A connection whose sends run dry with room left in the congestion
+    /// window reports itself application-limited to BBR, so the keep-alive
+    /// PING it sends next is acknowledged as an application-limited
+    /// delivery-rate sample rather than a bandwidth measurement.
+    #[test]
+    fn conn_running_out_of_data_marks_bbr_samples_app_limited() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_congestion_control_algorithm(CongestionControlAlgorithm::Bbr);
+        client_config.set_initial_max_data(1 << 20);
+        client_config.set_initial_max_stream_data_bidi_remote(1 << 20);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_initial_max_data(1 << 20);
+        server_config.set_initial_max_stream_data_bidi_remote(1 << 20);
+        // Acknowledge the lone PING at once: the test does not advance the
+        // clock to the delayed-ACK timer.
+        server_config.set_ack_eliciting_threshold(1);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        assert_eq!(test_pair.handshake(), Ok(()));
+
+        let data = TestPair::new_test_data(20_000);
+        test_pair.client.stream_write(0, data, true)?;
+        test_pair.move_forward()?;
+
+        test_pair.client.ping(None)?;
+        test_pair.move_forward()?;
+
+        let (local, remote) = {
+            let path = test_pair.client.paths.get_active()?;
+            (path.local_addr(), path.remote_addr())
+        };
+        let stats = test_pair.client.get_path_stats(local, remote)?;
+        assert!(stats.bandwidth_model_valid);
+        assert!(
+            stats.delivery_rate_sample_app_limited,
+            "the PING sent after the stream ran dry must be an app-limited sample"
+        );
+        Ok(())
+    }
+
     #[test]
     fn conn_max_streams_bidi() -> Result<()> {
         let mut client_config = TestPair::new_test_config(false)?;
@@ -7818,6 +8977,681 @@ pub(crate) mod tests {
 
         let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
         TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        Ok(())
+    }
+
+    // Data in flight on a path that went dark is retransmitted on the
+    // remaining path as soon as that path is abandoned, without waiting for
+    // PTO probes on the dead path.
+    #[test]
+    fn conn_multipath_abandon_path_retransmits_its_inflight_data() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_cid_len(crate::MAX_CID_LEN);
+        client_config.enable_multipath(true);
+        client_config.set_multipath_algorithm(MultipathAlgorithm::MinRtt);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_cid_len(crate::MAX_CID_LEN);
+        server_config.enable_multipath(true);
+        server_config.set_multipath_algorithm(MultipathAlgorithm::MinRtt);
+        for config in [&mut client_config, &mut server_config] {
+            config.set_initial_max_data(1 << 20);
+            config.set_initial_max_stream_data_bidi_local(1 << 20);
+            config.set_initial_max_stream_data_bidi_remote(1 << 20);
+        }
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+
+        test_pair.handshake()?;
+        test_pair.advertise_new_cids()?;
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+
+        // More than one initial window, so both paths carry some of it.
+        let data = Bytes::from(vec![7u8; 40_000]);
+        assert_eq!(test_pair.client.stream_write(4, data.clone(), true), Ok(data.len()));
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        let (dark, delivered): (Vec<_>, Vec<_>) =
+            packets.into_iter().partition(|(_, info)| info.src == client_addr);
+        assert!(!dark.is_empty(), "the second path must carry part of the data");
+        TestPair::conn_packets_in(&mut test_pair.server, delivered)?;
+
+        test_pair.client.abandon_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+
+        let mut buf = vec![0; 65536];
+        let mut read = 0;
+        while let Ok((n, _)) = test_pair.server.stream_read(4, &mut buf) {
+            read += n;
+            test_pair.move_forward()?;
+        }
+        assert_eq!(read, data.len());
+        Ok(())
+    }
+
+    fn multipath_pair_with_two_paths() -> Result<(TestPair, SocketAddr, SocketAddr)> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        let mut server_config = TestPair::new_test_config(true)?;
+        for config in [&mut client_config, &mut server_config] {
+            config.set_cid_len(crate::MAX_CID_LEN);
+            config.enable_multipath(true);
+            config.set_multipath_algorithm(MultipathAlgorithm::MinRtt);
+            config.set_initial_max_data(1 << 20);
+            config.set_initial_max_stream_data_bidi_local(1 << 20);
+            config.set_initial_max_stream_data_bidi_remote(1 << 20);
+        }
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.advertise_new_cids()?;
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        Ok((test_pair, client_addr, server_addr))
+    }
+
+    // A path the receiver holds idle (target rate 0) must still acknowledge
+    // what the peer keeps sending on it.
+    #[test]
+    fn conn_multipath_idle_path_still_acks() -> Result<()> {
+        let (mut test_pair, client_addr, server_addr) = multipath_pair_with_two_paths()?;
+        // The client sends only on the second path; the server idles it.
+        let first_client_addr = test_pair
+            .client
+            .paths_iter()
+            .map(|p| p.local)
+            .find(|addr| *addr != client_addr)
+            .unwrap();
+        test_pair
+            .client
+            .set_path_target_rate(first_client_addr, server_addr, Some(0))?;
+        test_pair
+            .server
+            .set_path_target_rate(server_addr, client_addr, Some(0))?;
+
+        let data = Bytes::from(vec![7u8; 3000]);
+        assert_eq!(test_pair.client.stream_write(4, data.clone(), true), Ok(data.len()));
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(packets.iter().any(|(_, info)| info.src == client_addr));
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+
+        let replies = TestPair::conn_packets_out(&mut test_pair.server)?;
+        assert!(
+            replies.iter().any(|(_, info)| info.dst == client_addr),
+            "the idle path must carry the ACKs for its own packet number space"
+        );
+        TestPair::conn_packets_in(&mut test_pair.client, replies)?;
+        test_pair.move_forward()?;
+
+        // A keep-alive PING also goes out on the idle path.
+        test_pair.server.ping(Some(FourTuple {
+            local: server_addr,
+            remote: client_addr,
+        }))?;
+        let pings = TestPair::conn_packets_out(&mut test_pair.server)?;
+        assert!(pings.iter().any(|(_, info)| info.dst == client_addr));
+        Ok(())
+    }
+
+    // Adding back a 4-tuple that was abandoned brings the path back into use.
+    // Abandoning a path tells the peer, which stops sending on it as well.
+    #[test]
+    fn conn_multipath_abandon_path_is_signalled_to_the_peer() -> Result<()> {
+        let (mut test_pair, client_addr, server_addr) = multipath_pair_with_two_paths()?;
+        assert!(test_pair.server.get_path(server_addr, client_addr)?.active());
+
+        test_pair.client.abandon_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        let server_path = test_pair.server.get_path(server_addr, client_addr)?;
+        assert!(server_path.is_abandoned());
+        assert!(!server_path.active());
+
+        // Traffic now flows on the remaining path only, both ways.
+        let data = Bytes::from(vec![9u8; 3000]);
+        assert_eq!(test_pair.client.stream_write(4, data.clone(), true), Ok(data.len()));
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(packets.iter().all(|(_, info)| info.src != client_addr));
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let replies = TestPair::conn_packets_out(&mut test_pair.server)?;
+        assert!(!replies.is_empty());
+        assert!(replies.iter().all(|(_, info)| info.dst != client_addr));
+        Ok(())
+    }
+
+    #[test]
+    fn conn_multipath_readding_an_abandoned_four_tuple_opens_a_new_path() -> Result<()> {
+        let (mut test_pair, client_addr, server_addr) = multipath_pair_with_two_paths()?;
+        let mut token = 100;
+        let old_client_dcid = test_pair.client.get_path(client_addr, server_addr)?.dcid_seq;
+        let old_server_scid = test_pair.server.get_path(server_addr, client_addr)?.scid_seq;
+        test_pair.client.abandon_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+
+        // The abandoned path is dropped on the spot; without a spare CID the
+        // new one waits until the peer has replaced the retired one.
+        assert_eq!(test_pair.client.add_path(client_addr, server_addr), Err(Error::Done));
+        assert!(test_pair.client.get_path(client_addr, server_addr).is_err());
+        top_up_scids(&mut test_pair, &mut token)?;
+        assert!(test_pair.client.add_path(client_addr, server_addr).is_ok());
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        // The server's new path needs a CID of the client's for its own
+        // direction: the one its dropped path used was retired.
+        top_up_scids(&mut test_pair, &mut token)?;
+        test_pair.move_forward()?;
+
+        // A new path on both ends: new CIDs, validated, and not abandoned.
+        let client_path = test_pair.client.get_path(client_addr, server_addr)?;
+        assert!(client_path.validated(), "client {:?}", client_path.state());
+        assert!(!client_path.is_abandoned());
+        assert!(client_path.active(), "client dcid {:?}", client_path.dcid_seq);
+        assert_ne!(client_path.dcid_seq, old_client_dcid);
+        let server_path = test_pair.server.get_path(server_addr, client_addr)?;
+        assert!(server_path.validated(), "server {:?}", server_path.state());
+        assert!(!server_path.is_abandoned());
+        assert!(server_path.active(), "server dcid {:?}", server_path.dcid_seq);
+        assert_ne!(server_path.scid_seq, old_server_scid);
+        assert_eq!(test_pair.client.paths_iter().count(), 2);
+        assert_eq!(test_pair.server.paths_iter().count(), 2);
+        assert!(test_pair.client.cids.get_dcid(old_client_dcid.unwrap()).is_err());
+
+        // Data flows over it.
+        test_pair.client.set_path_target_rate(client_addr, server_addr, None)?;
+        let data = Bytes::from(vec![5u8; 40_000]);
+        assert_eq!(test_pair.client.stream_write(4, data.clone(), true), Ok(data.len()));
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(packets.iter().any(|(_, info)| info.src == client_addr));
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        test_pair.move_forward()?;
+        let mut buf = vec![0; 65536];
+        let mut read = 0;
+        while let Ok((n, _)) = test_pair.server.stream_read(4, &mut buf) {
+            read += n;
+            test_pair.move_forward()?;
+        }
+        assert_eq!(read, data.len());
+        Ok(())
+    }
+
+    // Acts as the endpoint does for a connection: hands out source CIDs up to
+    // the peer's limit (at startup, and again for every one the peer retired).
+    fn top_up_scids(test_pair: &mut TestPair, next_token: &mut u128) -> Result<()> {
+        test_pair.move_forward()?;
+        for conn in [&mut test_pair.client, &mut test_pair.server] {
+            while conn.poll().is_some() {}
+            loop {
+                *next_token += 1;
+                match conn.add_scid(ConnectionId::random(), *next_token, false) {
+                    Ok(_) => (),
+                    Err(Error::ConnectionIdLimitError) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        test_pair.move_forward()
+    }
+
+    // Both ends run the timers far enough ahead for every abandoned path to
+    // have drained.
+    fn expire_path_drain(test_pair: &mut TestPair) {
+        let later = time::Instant::now() + Duration::from_secs(30);
+        for conn in [&mut test_pair.client, &mut test_pair.server] {
+            conn.timeout();
+            conn.on_timeout(later);
+        }
+    }
+
+    fn multipath_pair_with_cid_limit(limit: u64) -> Result<(TestPair, u128)> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        let mut server_config = TestPair::new_test_config(true)?;
+        for config in [&mut client_config, &mut server_config] {
+            config.set_cid_len(crate::MAX_CID_LEN);
+            config.enable_multipath(true);
+            config.set_multipath_algorithm(MultipathAlgorithm::MinRtt);
+            config.set_active_connection_id_limit(limit);
+            config.set_initial_max_data(1 << 20);
+            config.set_initial_max_stream_data_bidi_local(1 << 20);
+            config.set_initial_max_stream_data_bidi_remote(1 << 20);
+        }
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        let mut token = 100;
+        top_up_scids(&mut test_pair, &mut token)?;
+        Ok((test_pair, token))
+    }
+
+    // Opening and abandoning paths over and over must neither run out of path
+    // slots nor of connection IDs: an abandoned path gives both back once it
+    // has drained.
+    fn abandon_paths_in_a_loop(abandoned_by_client: bool) -> Result<()> {
+        const LIMIT: usize = 4;
+        let (mut test_pair, mut token) = multipath_pair_with_cid_limit(LIMIT as u64)?;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+
+        for i in 0..24u16 {
+            let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9500 + i);
+            test_pair.add_and_validate_path(client_addr, server_addr)?;
+            test_pair.move_forward()?;
+            assert!(test_pair.client.get_path(client_addr, server_addr)?.validated());
+            assert!(test_pair.server.get_path(server_addr, client_addr)?.validated());
+            assert_eq!(test_pair.client.paths_iter().count(), 2);
+            assert_eq!(test_pair.server.paths_iter().count(), 2);
+
+            if abandoned_by_client {
+                test_pair.client.abandon_path(client_addr, server_addr)?;
+            } else {
+                test_pair.server.abandon_path(server_addr, client_addr)?;
+            }
+            test_pair.move_forward()?;
+            expire_path_drain(&mut test_pair);
+            top_up_scids(&mut test_pair, &mut token)?;
+
+            for conn in [&test_pair.client, &test_pair.server] {
+                assert_eq!(conn.paths_iter().count(), 1, "round {i}");
+                assert!(conn.cids.dcid_iter().count() <= LIMIT, "round {i}");
+                assert!(conn.cids.scid_iter().count() <= LIMIT, "round {i}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conn_multipath_abandoned_paths_release_cids_and_slots() -> Result<()> {
+        abandon_paths_in_a_loop(true)
+    }
+
+    // The spike's S5 (`spike/noq_mp/RESULTS.md`): beside two lasting paths,
+    // a path on a fresh local port is opened, abandoned as soon as it is
+    // validated, and drained, over and over; data must keep flowing. The
+    // spike's client stopped sending on every path after 11 to 23 rounds.
+    #[test]
+    fn conn_multipath_data_keeps_flowing_through_path_churn() -> Result<()> {
+        let (mut test_pair, mut token) = multipath_pair_with_cid_limit(16)?;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        let lasting = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9400);
+        test_pair.add_and_validate_path(lasting, server_addr)?;
+        test_pair.move_forward()?;
+
+        let mut buf = vec![0; 65536];
+        for i in 0..40u16 {
+            let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9500 + i);
+            test_pair.add_and_validate_path(client_addr, server_addr)?;
+            test_pair.client.abandon_path(client_addr, server_addr)?;
+            test_pair.move_forward()?;
+            expire_path_drain(&mut test_pair);
+            top_up_scids(&mut test_pair, &mut token)?;
+
+            let data = Bytes::from(vec![i as u8; 3000]);
+            assert_eq!(test_pair.client.stream_write(4, data, false), Ok(3000), "round {i}");
+            test_pair.move_forward()?;
+            let mut read = 0;
+            while let Ok((n, _)) = test_pair.server.stream_read(4, &mut buf) {
+                read += n;
+            }
+            assert_eq!(read, 3000, "round {i}");
+            assert_eq!(test_pair.client.paths_iter().count(), 2, "round {i}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conn_multipath_peer_abandon_also_releases() -> Result<()> {
+        abandon_paths_in_a_loop(false)
+    }
+
+    // The RETIRE_CONNECTION_ID for the CID of a discarded path goes out on
+    // the remaining path, never on a packet addressed to that CID (RFC 9000
+    // Section 19.16), and the peer accepts it.
+    #[test]
+    fn conn_multipath_retire_frame_never_on_retired_cid() -> Result<()> {
+        let (mut test_pair, _) = multipath_pair_with_cid_limit(4)?;
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        let pid = test_pair
+            .client
+            .paths
+            .get_path_id(&(client_addr, server_addr))
+            .unwrap();
+        let retired_seq = test_pair.client.paths.get(pid)?.dcid_seq.unwrap();
+
+        test_pair.client.abandon_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        // Only the client's timers run: the server still has the path.
+        let later = time::Instant::now() + Duration::from_secs(30);
+        test_pair.client.timeout();
+        test_pair.client.on_timeout(later);
+        assert!(test_pair.client.paths.get_path_id(&(client_addr, server_addr)).is_none());
+        assert!(test_pair.client.cids.get_dcid(retired_seq).is_err());
+        assert!(test_pair.client.cids.next_dcid_to_retire().is_some());
+
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(!packets.is_empty());
+        assert!(packets.iter().all(|(_, info)| info.src != client_addr));
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        assert!(!test_pair.server.is_closed() && !test_pair.server.is_closing());
+        assert!(test_pair.server.cids.get_scid(retired_seq).is_err());
+        assert!(test_pair.client.cids.next_dcid_to_retire().is_none());
+        Ok(())
+    }
+
+    // A path whose packets all vanish stops being scheduled after repeated
+    // PTOs and its in-flight data goes out on the other path, without waiting
+    // for the path to be given up; the first ACK on it ends the back-off.
+    #[test]
+    fn conn_multipath_pto_backed_off_path_is_skipped_then_resumes() -> Result<()> {
+        let (mut test_pair, client_addr, server_addr) = multipath_pair_with_two_paths()?;
+        let pid = test_pair
+            .client
+            .paths
+            .get_path_id(&(client_addr, server_addr))
+            .unwrap();
+
+        // More than one initial window: both paths carry part of it; the
+        // second path's packets are dropped.
+        let data = Bytes::from(vec![7u8; 40_000]);
+        assert_eq!(test_pair.client.stream_write(4, data.clone(), true), Ok(data.len()));
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        let (dark, delivered): (Vec<_>, Vec<_>) =
+            packets.into_iter().partition(|(_, info)| info.src == client_addr);
+        assert!(!dark.is_empty(), "the second path must carry part of the data");
+        TestPair::conn_packets_in(&mut test_pair.server, delivered)?;
+
+        // PTOs fire on the dark path; everything it sends is dropped as well.
+        let mut rounds = 0;
+        while !test_pair.client.paths.get(pid)?.backed_off() {
+            rounds += 1;
+            assert!(rounds < 20, "the path never backed off");
+            test_pair.client.timeout();
+            let timer = test_pair.client.timers.get(Timer::LossDetection).unwrap();
+            test_pair.client.on_timeout(timer);
+            let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+            let delivered: Vec<_> = packets
+                .into_iter()
+                .filter(|(_, info)| info.src != client_addr)
+                .collect();
+            TestPair::conn_packets_in(&mut test_pair.server, delivered)?;
+            let replies = TestPair::conn_packets_out(&mut test_pair.server)?;
+            TestPair::conn_packets_in(&mut test_pair.client, replies)?;
+        }
+
+        // All the data arrives over the other path alone.
+        let mut buf = vec![0; 65536];
+        let mut read = 0;
+        for _ in 0..200 {
+            let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+            let delivered: Vec<_> = packets
+                .into_iter()
+                .filter(|(_, info)| info.src != client_addr)
+                .collect();
+            TestPair::conn_packets_in(&mut test_pair.server, delivered)?;
+            while let Ok((n, _)) = test_pair.server.stream_read(4, &mut buf) {
+                read += n;
+            }
+            // Delayed ACKs are due.
+            test_pair.server.timeout();
+            if let Some(timer) = test_pair.server.timers.get(Timer::Ack) {
+                test_pair.server.on_timeout(timer);
+            }
+            let replies = TestPair::conn_packets_out(&mut test_pair.server)?;
+            TestPair::conn_packets_in(&mut test_pair.client, replies)?;
+            if read == data.len() {
+                break;
+            }
+        }
+        assert_eq!(read, data.len());
+        assert!(test_pair.client.paths.get(pid)?.backed_off());
+
+        // New data is not scheduled on the backed-off path.
+        let more = Bytes::from(vec![8u8; 40_000]);
+        assert_eq!(test_pair.client.stream_write(8, more.clone(), true), Ok(more.len()));
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(!packets.is_empty());
+        assert!(packets.iter().all(|(_, info)| info.src != client_addr));
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+
+        // The batch is delivered and acknowledged over the live path, so what
+        // is left to time out is the dark path's own loss detection.
+        for _ in 0..100 {
+            test_pair.server.timeout();
+            if let Some(timer) = test_pair.server.timers.get(Timer::Ack) {
+                test_pair.server.on_timeout(timer);
+            }
+            let replies = TestPair::conn_packets_out(&mut test_pair.server)?;
+            let more: Vec<_> = TestPair::conn_packets_out(&mut test_pair.client)?
+                .into_iter()
+                .filter(|(_, info)| info.src != client_addr)
+                .collect();
+            if replies.is_empty() && more.is_empty() {
+                break;
+            }
+            TestPair::conn_packets_in(&mut test_pair.client, replies)?;
+            TestPair::conn_packets_in(&mut test_pair.server, more)?;
+        }
+
+        // A probe getting through ends the back-off. Its PTO keeps firing
+        // with backoff while the path stays dark, so give it a few rounds.
+        let mut probes = Vec::new();
+        for _ in 0..10 {
+            test_pair.client.timeout();
+            let Some(timer) = test_pair.client.timers.get(Timer::LossDetection) else {
+                break;
+            };
+            test_pair.client.on_timeout(timer);
+            let (dark, live): (Vec<_>, Vec<_>) =
+                TestPair::conn_packets_out(&mut test_pair.client)?
+                    .into_iter()
+                    .partition(|(_, info)| info.src == client_addr);
+            TestPair::conn_packets_in(&mut test_pair.server, live)?;
+            if !dark.is_empty() {
+                probes = dark;
+                break;
+            }
+        }
+        assert!(!probes.is_empty(), "the backed-off path must still get its PTO probes");
+        TestPair::conn_packets_in(&mut test_pair.server, probes)?;
+        let replies = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, replies)?;
+        assert!(!test_pair.client.paths.get(pid)?.backed_off());
+
+        let again = Bytes::from(vec![9u8; 60_000]);
+        assert_eq!(test_pair.client.stream_write(0, again.clone(), true), Ok(again.len()));
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(packets.iter().any(|(_, info)| info.src == client_addr));
+        Ok(())
+    }
+
+    // The new path's first packets (new CID) can overtake the PATH_ABANDON
+    // for the old path on the same 4-tuple, which travels on another path. A
+    // packet on an open path's 4-tuple addressed to a new, unused CID is a new
+    // path, not a CID rotation: the old path is dropped and the late
+    // PATH_ABANDON changes nothing.
+    #[test]
+    fn conn_multipath_new_cid_overtaking_path_abandon_opens_a_new_path() -> Result<()> {
+        let (mut test_pair, mut token) = multipath_pair_with_cid_limit(4)?;
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        let old_pid = test_pair
+            .server
+            .paths
+            .get_path_id(&(server_addr, client_addr))
+            .unwrap();
+        let old_space = test_pair.server.paths.get(old_pid)?.space_id;
+        let old_scid = test_pair.server.paths.get(old_pid)?.scid_seq;
+        let old_serial = test_pair.server.paths.get(old_pid)?.serial();
+        test_pair.server.take_path_events();
+
+        // The PATH_ABANDON is held back on its way to the server.
+        test_pair.client.abandon_path(client_addr, server_addr)?;
+        let abandon = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(!abandon.is_empty());
+        assert!(abandon.iter().all(|(_, info)| info.src != client_addr));
+
+        // The new path's PATH_CHALLENGE arrives first.
+        test_pair.client.add_path(client_addr, server_addr)?;
+        let (challenge, others): (Vec<_>, Vec<_>) =
+            TestPair::conn_packets_out(&mut test_pair.client)?
+                .into_iter()
+                .partition(|(_, info)| info.src == client_addr);
+        assert!(!challenge.is_empty());
+        TestPair::conn_packets_in(&mut test_pair.server, challenge)?;
+        TestPair::conn_packets_in(&mut test_pair.server, abandon)?;
+        TestPair::conn_packets_in(&mut test_pair.server, others)?;
+        assert!(!test_pair.server.is_closed() && !test_pair.server.is_closing());
+        let events = test_pair.server.take_path_events();
+        assert!(matches!(
+            events[..],
+            [
+                crate::PathLifecycleEvent::Abandoned { serial, by_peer: true, .. },
+                crate::PathLifecycleEvent::Discarded { serial: gone, .. },
+                crate::PathLifecycleEvent::Opened { serial: new, .. },
+            ] if serial == old_serial && gone == old_serial && new != old_serial
+        ), "{events:?}");
+
+        top_up_scids(&mut test_pair, &mut token)?;
+        test_pair.move_forward()?;
+
+        let server_path = test_pair.server.get_path(server_addr, client_addr)?;
+        assert!(server_path.validated() && !server_path.is_abandoned());
+        assert_ne!(server_path.scid_seq, old_scid);
+        let new_pid = test_pair
+            .server
+            .paths
+            .get_path_id(&(server_addr, client_addr))
+            .unwrap();
+        assert_ne!(test_pair.server.paths.get(new_pid)?.space_id, old_space);
+        let client_path = test_pair.client.get_path(client_addr, server_addr)?;
+        assert!(client_path.validated() && !client_path.is_abandoned());
+        assert_eq!(test_pair.server.paths_iter().count(), 2);
+
+        // Data flows over it.
+        let data = Bytes::from(vec![3u8; 40_000]);
+        assert_eq!(test_pair.client.stream_write(4, data.clone(), true), Ok(data.len()));
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(packets.iter().any(|(_, info)| info.src == client_addr));
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        test_pair.move_forward()?;
+        let mut buf = vec![0; 65536];
+        let mut read = 0;
+        while let Ok((n, _)) = test_pair.server.stream_read(4, &mut buf) {
+            read += n;
+            test_pair.move_forward()?;
+        }
+        assert_eq!(read, data.len());
+        Ok(())
+    }
+
+    // A straggler of a dropped path, addressed to its CID, arrives after a new
+    // path was opened on the same 4-tuple: it is neither a new path nor a CID
+    // rotation, and must leave the new path alone.
+    #[test]
+    fn conn_multipath_straggler_of_a_discarded_path_leaves_the_new_path_alone() -> Result<()> {
+        let (mut test_pair, mut token) = multipath_pair_with_cid_limit(4)?;
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+
+        // A packet of the old path, held back.
+        let data = Bytes::from(vec![1u8; 3000]);
+        assert_eq!(test_pair.client.stream_write(4, data, false), Ok(3000));
+        let straggler: Vec<_> = TestPair::conn_packets_out(&mut test_pair.client)?
+            .into_iter()
+            .filter(|(_, info)| info.src == client_addr)
+            .collect();
+        assert!(!straggler.is_empty());
+
+        test_pair.client.abandon_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        // Both ends drop the old path; the RETIRE_CONNECTION_IDs are not out yet.
+        expire_path_drain(&mut test_pair);
+        assert_eq!(test_pair.server.paths_iter().count(), 1);
+
+        // A straggler alone does not make a path.
+        TestPair::conn_packets_in(&mut test_pair.server, straggler.clone())?;
+        assert_eq!(test_pair.server.paths_iter().count(), 1);
+
+        // The new path on the same 4-tuple (only its own packets for now).
+        test_pair.client.add_path(client_addr, server_addr)?;
+        let (challenge, others): (Vec<_>, Vec<_>) =
+            TestPair::conn_packets_out(&mut test_pair.client)?
+                .into_iter()
+                .partition(|(_, info)| info.src == client_addr);
+        assert!(!challenge.is_empty());
+        TestPair::conn_packets_in(&mut test_pair.server, challenge)?;
+        let serial = test_pair
+            .server
+            .get_path(server_addr, client_addr)?
+            .serial();
+
+        TestPair::conn_packets_in(&mut test_pair.server, straggler)?;
+        let path = test_pair.server.get_path(server_addr, client_addr)?;
+        assert!(!path.is_abandoned());
+        assert_eq!(path.serial(), serial);
+        assert_eq!(test_pair.server.paths_iter().count(), 2);
+
+        TestPair::conn_packets_in(&mut test_pair.server, others)?;
+        top_up_scids(&mut test_pair, &mut token)?;
+        test_pair.move_forward()?;
+        let path = test_pair.server.get_path(server_addr, client_addr)?;
+        assert!(path.validated() && path.serial() == serial);
+        assert!(test_pair.client.get_path(client_addr, server_addr)?.validated());
+        Ok(())
+    }
+
+    // The host learns what became of its paths from events, in order, each
+    // path told apart by its serial; a 4-tuple opened again gets a new one.
+    #[test]
+    fn conn_multipath_path_events_follow_the_lifecycle() -> Result<()> {
+        use crate::PathLifecycleEvent::*;
+        let (mut test_pair, mut token) = multipath_pair_with_cid_limit(4)?;
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.client.take_path_events();
+        test_pair.server.take_path_events();
+
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        let client_events = test_pair.client.take_path_events();
+        let server_events = test_pair.server.take_path_events();
+        let [Opened { serial: first_client, .. }] = client_events[..] else {
+            panic!("{client_events:?}");
+        };
+        let [Opened { serial: first_server, .. }] = server_events[..] else {
+            panic!("{server_events:?}");
+        };
+
+        test_pair.client.abandon_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        expire_path_drain(&mut test_pair);
+        let client_events = test_pair.client.take_path_events();
+        let server_events = test_pair.server.take_path_events();
+        assert!(matches!(
+            client_events[..],
+            [Abandoned { serial, by_peer: false, .. }, Discarded { serial: gone, .. }]
+                if serial == first_client && gone == first_client
+        ), "{client_events:?}");
+        assert!(matches!(
+            server_events[..],
+            [Abandoned { serial, by_peer: true, .. }, Discarded { serial: gone, .. }]
+                if serial == first_server && gone == first_server
+        ), "{server_events:?}");
+
+        // The same 4-tuple again is a new path.
+        top_up_scids(&mut test_pair, &mut token)?;
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        test_pair.move_forward()?;
+        let [Opened { serial, .. }] = test_pair.client.take_path_events()[..] else {
+            panic!("client reopen");
+        };
+        assert_ne!(serial, first_client);
+        let [Opened { serial, .. }] = test_pair.server.take_path_events()[..] else {
+            panic!("server reopen");
+        };
+        assert_ne!(serial, first_server);
         Ok(())
     }
 
@@ -8279,9 +10113,681 @@ pub(crate) mod tests {
 
         Ok(())
     }
+
+    // ---- RFC 9221 DATAGRAM and draft-ietf-quic-address-discovery ----
+
+    fn dgram_test_pair(client_max: u64, server_max: u64) -> Result<TestPair> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_max_datagram_frame_size(client_max);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_max_datagram_frame_size(server_max);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.move_forward()?;
+        Ok(test_pair)
+    }
+
+    #[test]
+    fn dgram_disabled_by_default_and_unsupported_by_peer() -> Result<()> {
+        let mut test_pair = dgram_test_pair(0, 1500)?;
+        assert_eq!(
+            test_pair
+                .client
+                .dgram_send(Bytes::from_static(b"x"), false),
+            Err(SendDatagramError::Disabled)
+        );
+        assert_eq!(
+            test_pair
+                .server
+                .dgram_send(Bytes::from_static(b"x"), false),
+            Err(SendDatagramError::UnsupportedByPeer)
+        );
+        assert_eq!(test_pair.server.dgram_max_writable_len(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_default_config_keeps_the_transport_parameter_absent() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        test_pair.handshake()?;
+        assert_eq!(test_pair.client.peer_transport_params.max_datagram_frame_size, None);
+        assert_eq!(test_pair.server.peer_transport_params.max_datagram_frame_size, None);
+        assert_eq!(test_pair.client.peer_transport_params.address_discovery, None);
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_round_trip() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+
+        let data = Bytes::from_static(b"unreliable hello");
+        test_pair.client.dgram_send(data.clone(), false).unwrap();
+        assert_eq!(test_pair.client.dgram_send_queue_len(), 1);
+        assert_eq!(test_pair.client.dgram_send_queue_bytes(), data.len());
+
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(packets.iter().any(|(_, info)| info.send_meta.contains_data));
+        assert_eq!(test_pair.client.dgram_send_queue_len(), 0);
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+
+        assert!(test_pair.server.take_datagram_readable());
+        assert!(!test_pair.server.take_datagram_readable());
+        assert_eq!(test_pair.server.dgram_recv_queue_len(), 1);
+        assert_eq!(test_pair.server.dgram_recv(), Some(data));
+        assert_eq!(test_pair.server.dgram_recv(), None);
+
+        test_pair.move_forward()?;
+        let stats = test_pair.client.dgram_stats();
+        assert_eq!(stats.sent, 1);
+        assert_eq!(stats.acked, 1);
+        assert_eq!(stats.lost, 0);
+        assert_eq!(test_pair.server.dgram_stats().received, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_lost_is_counted_and_never_retransmitted() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+
+        test_pair
+            .client
+            .dgram_send(Bytes::from_static(b"lost"), false)
+            .unwrap();
+        let dropped = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(!dropped.is_empty());
+
+        for id in 10..14u64 {
+            let data = Bytes::from(format!("dgram {id}"));
+            test_pair.client.dgram_send(data, false).unwrap();
+            let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+            TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        }
+        test_pair.move_forward()?;
+
+        let stats = test_pair.client.dgram_stats();
+        assert_eq!(stats.lost, 1);
+        assert_eq!(stats.acked, 4);
+
+        let mut received = vec![];
+        while let Some(d) = test_pair.server.dgram_recv() {
+            received.push(d);
+        }
+        assert_eq!(received.len(), 4);
+        assert!(received.iter().all(|d| d.as_ref() != b"lost"));
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_size_limits() -> Result<()> {
+        // The server accepts DATAGRAM frames of at most 100 bytes.
+        let mut test_pair = dgram_test_pair(65535, 100)?;
+        let max = test_pair.client.dgram_max_writable_len().unwrap();
+        assert_eq!(max, 100 - frame::MAX_DATAGRAM_OVERHEAD);
+        assert_eq!(
+            test_pair
+                .client
+                .dgram_send(TestPair::new_test_data(max + 1), false),
+            Err(SendDatagramError::TooLarge)
+        );
+        assert!(test_pair
+            .client
+            .dgram_send(TestPair::new_test_data(max), false)
+            .is_ok());
+
+        // Limited by the path MTU when the peer allows large frames.
+        let max = test_pair.server.dgram_max_writable_len().unwrap();
+        let mtu = test_pair
+            .server
+            .max_datagram_size(test_pair.server.paths.get_active_path_id()?);
+        assert!(max < mtu);
+        assert!(max + 60 > mtu);
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_receiver_rejects_frames_it_did_not_ask_for() -> Result<()> {
+        let mut test_pair = dgram_test_pair(0, 1500)?;
+        let frame = frame::Frame::Datagram {
+            data: Bytes::from_static(b"unexpected"),
+        };
+        assert!(test_pair
+            .build_packet_and_send(PacketType::OneRTT, &[frame], true)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_receiver_rejects_frames_above_its_limit() -> Result<()> {
+        let mut test_pair = dgram_test_pair(20, 1500)?;
+        let frame = frame::Frame::Datagram {
+            data: TestPair::new_test_data(40),
+        };
+        assert!(test_pair
+            .build_packet_and_send(PacketType::OneRTT, &[frame], true)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_shares_the_congestion_window_and_optionally_bypasses_it() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+
+        // Fill the congestion window.
+        {
+            let r = &mut test_pair.client.paths.get_active_mut()?.recovery;
+            r.bytes_in_flight = r.congestion.congestion_window() as usize;
+        }
+        test_pair
+            .client
+            .dgram_send(Bytes::from_static(b"held"), false)
+            .unwrap();
+        let _ = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert_eq!(test_pair.client.dgram_send_queue_len(), 1);
+
+        // RFC 9484 Section 10.2: datagrams may bypass the window when asked.
+        test_pair.client.dgram_set_bypass_cwnd(true);
+        assert!(test_pair.client.dgram_stats().bypass_active);
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert_eq!(test_pair.client.dgram_send_queue_len(), 0);
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        assert_eq!(test_pair.server.dgram_recv(), Some(Bytes::from_static(b"held")));
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_respects_the_data_gate() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+        test_pair
+            .client
+            .dgram_send(Bytes::from_static(b"gated"), false)
+            .unwrap();
+
+        let mut buf = vec![0; 1500];
+        let _ = test_pair.client.send(&mut buf, &GateSender::closed());
+        assert_eq!(test_pair.client.dgram_send_queue_len(), 1);
+
+        let (written, info) = test_pair.client.send(&mut buf, &GateSender::open())?;
+        assert!(written > 0);
+        assert!(info.send_meta.contains_data);
+        assert_eq!(test_pair.client.dgram_send_queue_len(), 0);
+        Ok(())
+    }
+
+    /// B1 of CAKE_SQM_PLAN.md: the packets of a send queue below QUIC can be
+    /// told apart by flow, so a packet carries the datagrams of one flow only
+    /// and reports it.
+    #[test]
+    fn dgram_packets_hold_one_flow_and_report_it() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+        for (flow, byte) in [(1u32, 1u8), (1, 2), (2, 3), (2, 4), (1, 5)] {
+            test_pair
+                .client
+                .dgram_send_with_flow(Bytes::from(vec![byte; 100]), false, flow)
+                .unwrap();
+        }
+        test_pair
+            .client
+            .dgram_send(Bytes::from(vec![6u8; 100]), false)
+            .unwrap();
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        let flows: Vec<_> = packets
+            .iter()
+            .filter(|(_, info)| info.send_meta.contains_data)
+            .map(|(_, info)| info.send_meta.flow_hash)
+            .collect();
+        assert_eq!(
+            flows,
+            vec![Some(1), Some(2), Some(1), None],
+            "queued order 1,1,2,2,1,none gives one packet per run of equal flow"
+        );
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let got: Vec<u8> = std::iter::from_fn(|| test_pair.server.dgram_recv())
+            .map(|d| d[0])
+            .collect();
+        assert_eq!(got, vec![1, 2, 3, 4, 5, 6], "order is kept");
+        Ok(())
+    }
+
+    #[test]
+    fn a_packet_with_stream_data_has_no_flow() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+        let sid = 0;
+        test_pair.client.stream_write(sid, Bytes::from(vec![9u8; 200]), false)?;
+        test_pair.client.dgram_send(Bytes::from(vec![1u8; 100]), false).unwrap();
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(packets
+            .iter()
+            .any(|(_, info)| info.send_meta.contains_data && info.send_meta.flow_hash.is_none()));
+        assert!(packets.iter().all(|(_, info)| info.send_meta.flow_hash.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_send_queue_drop_oldest_and_blocked() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_max_datagram_frame_size(65535);
+        client_config.set_datagram_buffer_sizes(1000, 100);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_max_datagram_frame_size(65535);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.move_forward()?;
+
+        let conn = &mut test_pair.client;
+        conn.dgram_send(TestPair::new_test_data(60), false).unwrap();
+        assert!(matches!(
+            conn.dgram_send(TestPair::new_test_data(60), false),
+            Err(SendDatagramError::Blocked(_))
+        ));
+        conn.dgram_send(TestPair::new_test_data(60), true).unwrap();
+        assert_eq!(conn.dgram_send_queue_len(), 1);
+        assert_eq!(conn.dgram_stats().dropped_outgoing, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_max_writable_len_grows_with_dplpmtud() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+        for _ in 0..20 {
+            test_pair
+                .client
+                .dgram_send(Bytes::from_static(b"probe traffic"), true)
+                .unwrap();
+            test_pair.move_forward()?;
+        }
+        let max = test_pair.client.dgram_max_writable_len().unwrap();
+        assert!(max >= 1400, "max datagram payload {max}");
+        Ok(())
+    }
+
+    /// A client and server with datagrams on and two validated paths, the
+    /// client's from 127.0.0.1:9443 (`first`) and 127.0.0.1:9444 (`second`).
+    fn dgram_multipath_pair(bypass: bool) -> Result<(TestPair, SocketAddr, SocketAddr, SocketAddr)> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_cid_len(crate::MAX_CID_LEN);
+        client_config.enable_multipath(true);
+        client_config.set_multipath_algorithm(MultipathAlgorithm::SqmWeighted);
+        client_config.set_max_datagram_frame_size(65535);
+        client_config.enable_datagram_bypass_cwnd(bypass);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_cid_len(crate::MAX_CID_LEN);
+        server_config.enable_multipath(true);
+        server_config.set_multipath_algorithm(MultipathAlgorithm::SqmWeighted);
+        server_config.set_max_datagram_frame_size(65535);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.advertise_new_cids()?;
+        let first = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9443);
+        let second = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(second, server)?;
+        test_pair.move_forward()?;
+        Ok((test_pair, first, second, server))
+    }
+
+    /// Give the client's path from `local` a steady delay of `rtt_ms`, as
+    /// measured over many round trips (rttvar near zero).
+    fn set_path_rtt(conn: &mut Connection, local: SocketAddr, rtt_ms: u64) -> Result<()> {
+        let rtt = time::Duration::from_millis(rtt_ms);
+        let pid = conn
+            .paths
+            .iter()
+            .find(|(_, p)| p.local_addr() == local)
+            .map(|(pid, _)| pid)
+            .ok_or(Error::InternalError)?;
+        let path = conn.paths.get_mut(pid)?;
+        path.recovery.rtt = rtt::RttEstimator::new(rtt);
+        for _ in 0..30 {
+            path.recovery.rtt.update(time::Duration::ZERO, rtt);
+        }
+        Ok(())
+    }
+
+    fn path_of(conn: &mut Connection, local: SocketAddr) -> Result<&mut path::Path> {
+        let pid = conn
+            .paths
+            .iter()
+            .find(|(_, p)| p.local_addr() == local)
+            .map(|(pid, _)| pid)
+            .ok_or(Error::InternalError)?;
+        conn.paths.get_mut(pid)
+    }
+
+    /// I2 (MP_FIX_PHASES.md S-I2): a standby path chosen to send a PING or an
+    /// ACK while the regular path's window is full carried STREAM and
+    /// DATAGRAM frames too. draft-ietf-quic-multipath Section 3.3: no data on
+    /// a backup path while another path is available.
+    #[test]
+    fn a_standby_path_carries_no_data_while_another_path_is_available() -> Result<()> {
+        for bypass in [false, true] {
+            let (mut test_pair, first, second, server) = dgram_multipath_pair(bypass)?;
+            test_pair.client.set_path_standby(second, server, true)?;
+            {
+                let r = &mut path_of(&mut test_pair.client, first)?.recovery;
+                r.bytes_in_flight = r.congestion.congestion_window() as usize;
+            }
+            path_of(&mut test_pair.client, second)?.need_send_ping = true;
+            test_pair.client.stream_write(0, Bytes::from(vec![9u8; 30]), false)?;
+            for _ in 0..5 {
+                test_pair
+                    .client
+                    .dgram_send_with_flow(TestPair::new_test_data(200), false, 7)
+                    .unwrap();
+            }
+
+            let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+            assert!(
+                packets.iter().any(|(_, info)| info.src == second),
+                "bypass={bypass}: the standby path still sends its PING"
+            );
+            assert!(
+                packets
+                    .iter()
+                    .all(|(_, info)| info.src != second || !info.send_meta.contains_data),
+                "bypass={bypass}: data on the standby path: {:?}",
+                packets
+                    .iter()
+                    .map(|(_, info)| (info.src, info.send_meta.contains_data))
+                    .collect::<Vec<_>>()
+            );
+            // Once no regular path is left, the standby path takes the data.
+            path_of(&mut test_pair.client, first)?.set_active(false);
+            let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+            assert!(packets
+                .iter()
+                .any(|(_, info)| info.src == second && info.send_meta.contains_data));
+        }
+        Ok(())
+    }
+
+    /// I6 (S-I5/I6): the datagrams of one flow were spread packet by packet
+    /// over a 20 ms and a 200 ms path, and the inner transport saw them out
+    /// of order. Now a flow keeps its path; a new flow goes where ECF places
+    /// it: a single datagram waits behind the full fast path, a backlog takes
+    /// the slower one.
+    #[test]
+    fn datagrams_of_a_flow_keep_one_path_and_a_new_flow_takes_the_free_one() -> Result<()> {
+        let (mut test_pair, first, second, server) = dgram_multipath_pair(true)?;
+        set_path_rtt(&mut test_pair.client, first, 20)?;
+        set_path_rtt(&mut test_pair.client, second, 200)?;
+        // 80 kB/s each: 1 600 bytes per round trip on the 20 ms path.
+        for local in [first, second] {
+            test_pair.client.set_path_target_rate(local, server, Some(80_000))?;
+        }
+
+        let mut sent = Vec::new();
+        let mut send = |test_pair: &mut TestPair, batch: &[(u32, usize)]| -> Result<()> {
+            for &(flow, count) in batch {
+                for _ in 0..count {
+                    test_pair
+                        .client
+                        .dgram_send_with_flow(TestPair::new_test_data(1_000), false, flow)
+                        .unwrap();
+                }
+            }
+            for (_, info) in TestPair::conn_packets_out(&mut test_pair.client)? {
+                if info.send_meta.contains_data {
+                    sent.push((info.send_meta.flow_hash, info.src));
+                }
+            }
+            Ok(())
+        };
+        send(&mut test_pair, &[(1, 1)])?;
+        path_of(&mut test_pair.client, first)?.recovery.bytes_in_flight = 2_000;
+        send(&mut test_pair, &[(3, 1)])?;
+        send(&mut test_pair, &[(2, 40), (1, 5)])?;
+        let paths_of = |flow: u32| {
+            sent.iter()
+                .filter(|(f, _)| *f == Some(flow))
+                .map(|(_, src)| *src)
+                .collect::<std::collections::HashSet<_>>()
+        };
+        assert_eq!(paths_of(1), [first].into(), "flow 1 kept the fast path: {sent:?}");
+        assert_eq!(paths_of(3), [first].into(), "flow 3 waits for the fast path: {sent:?}");
+        assert_eq!(paths_of(2), [second].into(), "flow 2's backlog took the free path: {sent:?}");
+        Ok(())
+    }
+
+    /// A flow moves only after a pause longer than the paths' delay
+    /// difference (flowlet switching): its next packet then cannot overtake
+    /// the last one.
+    #[test]
+    fn a_flow_moves_to_a_free_path_only_after_a_flowlet_gap() -> Result<()> {
+        let (mut test_pair, first, second, server) = dgram_multipath_pair(true)?;
+        set_path_rtt(&mut test_pair.client, first, 5)?;
+        set_path_rtt(&mut test_pair.client, second, 45)?;
+        for local in [first, second] {
+            test_pair.client.set_path_target_rate(local, server, Some(80_000))?;
+        }
+        let send = |test_pair: &mut TestPair,
+                    count: usize|
+         -> Result<std::collections::HashSet<SocketAddr>> {
+            for _ in 0..count {
+                test_pair
+                    .client
+                    .dgram_send_with_flow(TestPair::new_test_data(1_000), false, 1)
+                    .unwrap();
+            }
+            Ok(TestPair::conn_packets_out(&mut test_pair.client)?
+                .into_iter()
+                .filter(|(_, info)| info.send_meta.contains_data)
+                .map(|(_, info)| info.src)
+                .collect())
+        };
+        assert_eq!(send(&mut test_pair, 1)?, [first].into());
+        // The fast path is over its rate now (80 kB/s over 5 ms is less than
+        // one packet per round trip), and ECF would send a 40 kB backlog on
+        // the slower path; within the flowlet the flow stays.
+        path_of(&mut test_pair.client, first)?.recovery.bytes_in_flight = 2_000;
+        assert_eq!(send(&mut test_pair, 40)?, [first].into());
+        // A pause longer than 40 ms ends the flowlet.
+        std::thread::sleep(time::Duration::from_millis(60));
+        assert_eq!(send(&mut test_pair, 40)?, [second].into());
+        Ok(())
+    }
+
+    /// S-I1/S-I12: under the bypass, datagrams leave whatever the data gate
+    /// says (the sender's queue below QUIC is where they wait), while stream
+    /// data still waits for the gate.
+    #[test]
+    fn bypassed_datagrams_do_not_wait_for_the_data_gate() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_max_datagram_frame_size(65535);
+        client_config.enable_datagram_bypass_cwnd(true);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_max_datagram_frame_size(65535);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.move_forward()?;
+
+        test_pair.client.stream_write(0, Bytes::from(vec![9u8; 30]), false)?;
+        test_pair
+            .client
+            .dgram_send(Bytes::from_static(b"not gated"), false)
+            .unwrap();
+        let mut buf = vec![0; 1500];
+        while test_pair.client.send(&mut buf, &GateSender::closed()).is_ok() {}
+        assert_eq!(test_pair.client.dgram_send_queue_len(), 0);
+        assert_eq!(test_pair.client.stream_unsent_bytes(0), Some(30));
+        Ok(())
+    }
+
+    fn address_discovery_pair(client: bool, server: bool) -> Result<TestPair> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.enable_address_discovery(client);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.enable_address_discovery(server);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.move_forward()?;
+        Ok(test_pair)
+    }
+
+    fn active_observed(conn: &mut Connection) -> Option<SocketAddr> {
+        conn.paths.get_active().ok()?.observed_local_addr()
+    }
+
+    #[test]
+    fn observed_address_reported_on_the_validated_path() -> Result<()> {
+        let mut test_pair = address_discovery_pair(true, true)?;
+        assert_eq!(
+            active_observed(&mut test_pair.client),
+            Some("127.0.0.1:9443".parse().unwrap())
+        );
+        assert_eq!(
+            active_observed(&mut test_pair.server),
+            Some("127.0.0.1:443".parse().unwrap())
+        );
+        let pid = test_pair.client.paths.get_active_path_id()?;
+        assert_eq!(
+            test_pair.client.paths.get_mut(pid)?.stats().observed_local_addr,
+            Some("127.0.0.1:9443".parse().unwrap())
+        );
+        // Reported once: no OBSERVED_ADDRESS is pending afterwards.
+        assert!(!test_pair.server.paths.get_active()?.need_report_observed_addr());
+        Ok(())
+    }
+
+    #[test]
+    fn observed_address_only_after_negotiation() -> Result<()> {
+        // The server does not provide reports; the client does not ask.
+        for (client, server) in [(true, false), (false, true), (false, false)] {
+            let mut test_pair = address_discovery_pair(client, server)?;
+            if !(client && server) {
+                assert_eq!(active_observed(&mut test_pair.client), None);
+            }
+            if !(client && server) {
+                assert_eq!(active_observed(&mut test_pair.server), None);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn observed_address_stale_sequence_is_ignored() -> Result<()> {
+        let mut test_pair = address_discovery_pair(true, true)?;
+        let newer: SocketAddr = "203.0.113.7:4000".parse().unwrap();
+        let older: SocketAddr = "203.0.113.8:5000".parse().unwrap();
+        let frame = frame::Frame::ObservedAddress {
+            seq_num: 100,
+            addr: newer,
+        };
+        test_pair.build_packet_and_send(PacketType::OneRTT, &[frame], true)?;
+        assert_eq!(active_observed(&mut test_pair.client), Some(newer));
+
+        let frame = frame::Frame::ObservedAddress {
+            seq_num: 99,
+            addr: older,
+        };
+        test_pair.build_packet_and_send(PacketType::OneRTT, &[frame], true)?;
+        assert_eq!(active_observed(&mut test_pair.client), Some(newer));
+        Ok(())
+    }
+
+    #[test]
+    fn observed_address_rejected_when_not_requested() -> Result<()> {
+        let mut test_pair = address_discovery_pair(false, true)?;
+        let frame = frame::Frame::ObservedAddress {
+            seq_num: 0,
+            addr: "203.0.113.7:4000".parse().unwrap(),
+        };
+        assert!(test_pair
+            .build_packet_and_send(PacketType::OneRTT, &[frame], true)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn observed_address_differs_per_path() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_cid_len(crate::MAX_CID_LEN);
+        client_config.enable_multipath(true);
+        client_config.enable_address_discovery(true);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_cid_len(crate::MAX_CID_LEN);
+        server_config.enable_multipath(true);
+        server_config.enable_address_discovery(true);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.advertise_new_cids()?;
+
+        // A second source IP, as a second WAN would present it.
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        for _ in 0..3 {
+            test_pair.move_forward()?;
+        }
+
+        let mut observed: Vec<(SocketAddr, Option<SocketAddr>)> = test_pair
+            .client
+            .paths
+            .iter()
+            .map(|(_, p)| (p.local_addr(), p.observed_local_addr()))
+            .collect();
+        observed.sort();
+        assert_eq!(
+            observed,
+            vec![
+                (
+                    "127.0.0.1:9443".parse().unwrap(),
+                    Some("127.0.0.1:9443".parse().unwrap())
+                ),
+                (client_addr, Some(client_addr)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_address_report_on_a_blocked_path_does_not_shadow_other_paths() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_cid_len(crate::MAX_CID_LEN);
+        client_config.enable_multipath(true);
+        client_config.enable_address_discovery(true);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_cid_len(crate::MAX_CID_LEN);
+        server_config.enable_multipath(true);
+        server_config.enable_address_discovery(true);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.advertise_new_cids()?;
+        let second = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(second, server_addr)?;
+        for _ in 0..3 {
+            test_pair.move_forward()?;
+        }
+
+        let server = &mut test_pair.server;
+        let pid_of = |conn: &Connection, remote: bool| {
+            conn.paths
+                .iter()
+                .find(|(_, p)| (p.remote_addr() == second) == remote)
+                .map(|(pid, _)| pid)
+                .unwrap()
+        };
+        let (blocked, other) = (pid_of(server, false), pid_of(server, true));
+
+        // The first path owes a report but its congestion window is full;
+        // the second path has a PING to send.
+        let blocked_path = server.paths.get_mut(blocked)?;
+        let remote = blocked_path.remote_addr();
+        blocked_path.on_observed_addr_lost(remote);
+        blocked_path.recovery.bytes_in_flight = usize::MAX / 2;
+        server.paths.get_mut(other)?.need_send_ping = true;
+        assert_eq!(server.select_send_path(&NoopSender)?, other);
+
+        // Once the window opens the report goes out on its own path.
+        server.paths.get_mut(blocked)?.recovery.bytes_in_flight = 0;
+        server.paths.get_mut(other)?.need_send_ping = false;
+        assert_eq!(server.select_send_path(&NoopSender)?, blocked);
+        Ok(())
+    }
 }
 
 mod cid;
+mod datagrams;
 mod flowcontrol;
 pub mod path;
 mod pmtu;

@@ -566,10 +566,24 @@ impl Endpoint {
 
                 Event::ScidToAdvertise(num) => {
                     let key = &self.config.reset_token_key;
-                    Self::conn_add_scids(conn, num, &mut self.cid_gen, key, &mut self.routes);
+                    Self::conn_add_scids(conn, num, &mut self.cid_gen, key, &mut self.routes, true);
                 }
 
-                Event::ScidRetired(cid) => self.routes.remove_with_cid(&cid),
+                Event::ScidRetired(cid) => {
+                    self.routes.remove_with_cid(&cid);
+                    // Replace it, keeping the peer's supply at its limit. Every
+                    // abandoned path retires one; without this a multipath
+                    // connection that has cycled through its first IDs can
+                    // never add another path.
+                    if !conn.zero_length_scid()
+                        && !conn.is_closing()
+                        && !conn.is_draining()
+                        && !conn.is_closed()
+                    {
+                        let key = &self.config.reset_token_key;
+                        Self::conn_add_scids(conn, 1, &mut self.cid_gen, key, &mut self.routes, false);
+                    }
+                }
 
                 Event::DcidAdvertised(token) => self.routes.insert_with_token(token, idx),
 
@@ -604,6 +618,12 @@ impl Endpoint {
                 }
             }
         }
+        if conn.take_datagram_readable() {
+            self.handler.on_datagram_readable(conn);
+            if conn.is_closed() {
+                return false;
+            }
+        }
 
         // Add the connection to the sendable queue
         conn.mark_sendable(true);
@@ -630,11 +650,14 @@ impl Endpoint {
         gen: &mut Box<dyn ConnectionIdGenerator>,
         token_key: &hmac::Key,
         routes: &mut ConnectionRoutes,
+        retire_if_needed: bool,
     ) {
         for i in 0..num {
             let (scid, reset_token) = gen.generate_cid_and_token(token_key);
-            match conn.add_scid(scid, reset_token, true) {
+            match conn.add_scid(scid, reset_token, retire_if_needed) {
                 Ok(_) => (),
+                // A replacement when the peer already holds its limit.
+                Err(Error::ConnectionIdLimitError) if !retire_if_needed => break,
                 Err(e) => {
                     warn!("add scid to {:?} : {:?}", conn.trace_id(), e);
                     break;

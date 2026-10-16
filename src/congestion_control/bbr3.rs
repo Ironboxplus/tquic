@@ -1993,6 +1993,10 @@ impl CongestionController for Bbr3 {
             },
         })
     }
+
+    fn on_app_limited(&mut self) {
+        self.mark_connection_app_limited();
+    }
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::connection::path::HeldBack;
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::stream::StreamMap;
@@ -50,10 +51,10 @@ impl RoundRobinScheduler {
     }
 
     /// Try to select an available path
-    fn select(&mut self, iter: &mut slab::IterMut<Path>) -> Option<usize> {
+    fn select(&mut self, iter: &mut slab::IterMut<Path>, held: HeldBack) -> Option<usize> {
         for (pid, path) in iter.by_ref() {
             // Skip the path that is not ready for sending non-probing packets.
-            if !path.active() || !path.recovery.can_send() {
+            if !path.active() || !path.recovery.can_send() || held.applies(path) {
                 continue;
             }
 
@@ -72,6 +73,7 @@ impl MultipathScheduler for RoundRobinScheduler {
         spaces: &mut PacketNumSpaceMap,
         streams: &mut StreamMap,
     ) -> Result<usize> {
+        let held = paths.held_back();
         let mut iter = paths.iter_mut();
         let mut exist_last = false;
 
@@ -86,7 +88,7 @@ impl MultipathScheduler for RoundRobinScheduler {
         }
 
         // Find the next available path
-        if let Some(pid) = self.select(&mut iter) {
+        if let Some(pid) = self.select(&mut iter, held) {
             return Ok(pid);
         }
         if !exist_last {
@@ -94,7 +96,7 @@ impl MultipathScheduler for RoundRobinScheduler {
         }
 
         let mut iter = paths.iter_mut();
-        if let Some(pid) = self.select(&mut iter) {
+        if let Some(pid) = self.select(&mut iter, held) {
             return Ok(pid);
         }
         Err(Error::Done)

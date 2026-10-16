@@ -126,6 +126,22 @@ impl Dplpmtud {
         self.should_probe = !self.check_finish(peer_max_udp_payload);
     }
 
+    /// Handle a suspected PMTU black hole (RFC 8899 Section 4.3): packets of
+    /// the current size stopped getting through, e.g. the path's MTU shrank.
+    /// Fall back to the base PMTU, which QUIC guarantees, and search again.
+    /// Return whether the current size changed.
+    pub(super) fn on_black_hole(&mut self) -> bool {
+        if self.current_size <= crate::DEFAULT_SEND_UDP_PAYLOAD_SIZE {
+            return false;
+        }
+        self.current_size = crate::DEFAULT_SEND_UDP_PAYLOAD_SIZE;
+        self.failed_size = 0;
+        self.probe_size = None;
+        self.probe_count = 0;
+        self.should_probe = true;
+        true
+    }
+
     /// Calculate the size of probe packet
     fn cal_probe_size(&self, peer_max_udp_payload: usize) -> usize {
         let mtu_ceiling = self.cal_mtu_ceiling(peer_max_udp_payload);
@@ -249,5 +265,42 @@ mod tests {
 
         assert_eq!(d.get_current_size(), 1349);
         assert_eq!(d.should_probe(), false);
+    }
+
+    #[test]
+    fn dplpmtud_black_hole_falls_back_and_searches_again() {
+        let mut d = Dplpmtud::new(true, 1200, false);
+        let peer_max_udp_payload = 60000;
+        let probe_size = d.get_probe_size(peer_max_udp_payload);
+        d.on_pmtu_probe_sent(probe_size);
+        d.on_pmtu_probe_acked(probe_size, peer_max_udp_payload);
+        assert_eq!(d.get_current_size(), 1472);
+        assert!(!d.should_probe());
+
+        // The path MTU shrank: fall back to the base size and probe again.
+        assert!(d.on_black_hole());
+        assert_eq!(d.get_current_size(), crate::DEFAULT_SEND_UDP_PAYLOAD_SIZE);
+        assert!(d.should_probe());
+        // Already at the base size: nothing to do.
+        assert!(!d.on_black_hole());
+
+        // The search converges on the new, smaller PMTU.
+        let pmtu = 1272;
+        for _ in 0..20 {
+            let probe_size = d.get_probe_size(peer_max_udp_payload);
+            if probe_size > pmtu {
+                for _ in 0..MAX_PROBE_COUNT {
+                    d.on_pmtu_probe_sent(probe_size);
+                    d.on_pmtu_probe_lost(probe_size, peer_max_udp_payload);
+                }
+            } else {
+                d.on_pmtu_probe_sent(probe_size);
+                d.on_pmtu_probe_acked(probe_size, peer_max_udp_payload);
+            }
+            if !d.should_probe() {
+                break;
+            }
+        }
+        assert!(d.get_current_size() <= pmtu && d.get_current_size() > 1250);
     }
 }

@@ -46,6 +46,9 @@ pub(crate) enum Timer {
 
     /// When to declare PATH_CHALLENGE probing packet lost
     PathChallenge,
+
+    /// When the earliest abandoned path has drained and is to be discarded
+    PathDrain,
 }
 
 /// Associated timeout values with each `Timer`

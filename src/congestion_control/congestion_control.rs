@@ -232,6 +232,19 @@ pub trait CongestionController {
     /// max-flow allocation becomes each path's actual send rate with no
     /// separate channel.
     fn set_target_rate(&mut self, bps: Option<u64>) {}
+
+    /// The path's maximum datagram size changed (DPLPMTUD or a peer limit).
+    /// Default no-op keeps every existing algorithm's behaviour; `Brutal`
+    /// uses it as its window floor, like Hysteria's `SetMaxDatagramSize`.
+    fn set_max_datagram_size(&mut self, max_datagram_size: u64) {}
+
+    /// The sender has nothing more to send although neither the congestion
+    /// window nor the pacer holds it back: the packets in flight do not fill
+    /// the path, and rate samples taken until they are acknowledged say
+    /// nothing about its bandwidth (draft-cheng-iccrg-delivery-rate-estimation
+    /// Section 3.4, MarkConnectionAppLimited). Controllers without a
+    /// delivery-rate model keep the default no-op.
+    fn on_app_limited(&mut self) {}
 }
 
 impl fmt::Debug for dyn CongestionController {

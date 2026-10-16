@@ -48,9 +48,181 @@ use crate::TIMER_GRANULARITY;
 
 const INITIAL_PACKET_THRESHOLD: u64 = 3;
 
-const INITIAL_TIME_THRESHOLD: f64 = 9.0 / 8.0;
+/// The time threshold as the time allowed beyond an RTT, in eighths of an RTT:
+/// RFC 9002's kTimeThreshold of 9/8 at first, doubled up to two RTTs while
+/// reordering outlasts it (quic-go's `timeThresholdEighths`).
+const DEFAULT_TIME_THRESHOLD_EIGHTHS: u32 = 1;
+const MAX_TIME_THRESHOLD_EIGHTHS: u32 = 8;
 
 const MAX_PTO_PROBES_COUNT: usize = 2;
+
+/// Whether `space_id` is an application data packet number space.
+fn is_app_data(space_id: SpaceId) -> bool {
+    space_id != SpaceId::Initial && space_id != SpaceId::Handshake
+}
+
+/// Loss detection thresholds and probe timeout computation.
+///
+/// Everything else in `Recovery` (packet bookkeeping, timers, congestion
+/// control hooks) is shared; an implementation only decides when a packet
+/// counts as lost and how long a probe timeout is.
+pub(crate) trait LossDetection {
+    /// Name shown in runtime status.
+    fn name(&self) -> &'static str;
+
+    /// Time after which an unacknowledged packet sent before an
+    /// acknowledged one is declared lost. `app_data`: the packet is in an
+    /// application data space, where the thresholds follow the reordering
+    /// seen.
+    fn loss_delay(&self, latest_rtt: Duration, smoothed_rtt: Duration, app_data: bool) -> Duration;
+
+    /// Whether a packet is declared lost by the reordering threshold.
+    fn lost_by_reordering(&self, pkt_num: u64, largest_acked: u64, app_data: bool) -> bool;
+
+    /// An application data packet was sent.
+    fn on_app_data_sent(&mut self, pkt_num: u64);
+
+    /// Application data packets declared lost were acknowledged after all:
+    /// each one's packet number and how long after it was sent the peer
+    /// received it.
+    fn on_spurious_losses(
+        &mut self,
+        losses: &[(u64, Duration)],
+        latest_rtt: Duration,
+        smoothed_rtt: Duration,
+    );
+
+    /// Probe timeout after `pto_count` consecutive timeouts.
+    fn pto(&self, pto_base: Duration, pto_count: usize) -> Duration;
+
+    /// Probe timeout of the Application Data space, which also waits for the
+    /// peer's `max_ack_delay`.
+    fn pto_with_ack_delay(
+        &self,
+        duration: Duration,
+        max_ack_delay: Duration,
+        pto_count: usize,
+    ) -> Duration;
+}
+
+/// Loss detection as specified in RFC 9002 Section 6, with the thresholds of
+/// the application data spaces raised after spurious losses as Section 6.1
+/// allows. As in quic-go (`sentPacketHandler.detectSpuriousLosses`): once a
+/// packet declared lost is acknowledged after all, the packet threshold no
+/// longer applies, and the time threshold doubles, up to two RTTs, whenever
+/// such a packet arrived later than it allowed. Reordering then costs a wait
+/// of the time threshold instead of a retransmission and a congestion event.
+pub(crate) struct Rfc9002 {
+    /// Maximum reordering in packets before packet threshold loss detection
+    /// considers a packet lost.
+    pkt_thresh: u64,
+
+    /// A spurious loss was seen: application data is declared lost by the
+    /// time threshold only.
+    pkt_thresh_disabled: bool,
+
+    /// Time allowed beyond an RTT before an application data packet is
+    /// declared lost, in eighths of an RTT.
+    time_thresh_eighths: u32,
+
+    /// The first application data packet sent since the time threshold last
+    /// grew. Only packets from it on may make it grow again: earlier ones were
+    /// judged by the shorter threshold.
+    min_pkt_num_to_relax: Option<u64>,
+
+    /// The endpoint do not backoff the first `pto_linear_factor` consecutive probe timeouts.
+    pto_linear_factor: u64,
+
+    /// Upper limit of probe timeout.
+    max_pto: Duration,
+}
+
+impl Rfc9002 {
+    pub(crate) fn new(conf: &RecoveryConfig) -> Self {
+        Rfc9002 {
+            pkt_thresh: INITIAL_PACKET_THRESHOLD,
+            pkt_thresh_disabled: false,
+            time_thresh_eighths: DEFAULT_TIME_THRESHOLD_EIGHTHS,
+            min_pkt_num_to_relax: None,
+            pto_linear_factor: conf.pto_linear_factor,
+            max_pto: conf.max_pto,
+        }
+    }
+
+    fn backoff_factor(&self, pto_count: usize) -> u32 {
+        pto_count.saturating_sub(self.pto_linear_factor as usize) as u32
+    }
+}
+
+impl LossDetection for Rfc9002 {
+    fn name(&self) -> &'static str {
+        "tquic-rfc9002"
+    }
+
+    fn loss_delay(&self, latest_rtt: Duration, smoothed_rtt: Duration, app_data: bool) -> Duration {
+        let eighths = if app_data {
+            self.time_thresh_eighths
+        } else {
+            DEFAULT_TIME_THRESHOLD_EIGHTHS
+        };
+        let loss_delay = cmp::max(latest_rtt, smoothed_rtt) * (8 + eighths) / 8;
+        cmp::max(loss_delay, TIMER_GRANULARITY)
+    }
+
+    fn lost_by_reordering(&self, pkt_num: u64, largest_acked: u64, app_data: bool) -> bool {
+        if app_data && self.pkt_thresh_disabled {
+            return false;
+        }
+        pkt_num + self.pkt_thresh <= largest_acked
+    }
+
+    fn on_app_data_sent(&mut self, pkt_num: u64) {
+        self.min_pkt_num_to_relax.get_or_insert(pkt_num);
+    }
+
+    fn on_spurious_losses(
+        &mut self,
+        losses: &[(u64, Duration)],
+        latest_rtt: Duration,
+        smoothed_rtt: Duration,
+    ) {
+        if losses.is_empty() {
+            return;
+        }
+        self.pkt_thresh_disabled = true;
+        let max_time_reordering = losses
+            .iter()
+            .filter(|(pkt_num, _)| self.min_pkt_num_to_relax.is_some_and(|min| *pkt_num >= min))
+            .map(|(_, reordering)| *reordering)
+            .max();
+        let loss_delay = self.loss_delay(latest_rtt, smoothed_rtt, true);
+        if max_time_reordering.is_some_and(|reordering| reordering > loss_delay)
+            && self.time_thresh_eighths < MAX_TIME_THRESHOLD_EIGHTHS
+        {
+            self.time_thresh_eighths = cmp::min(2 * self.time_thresh_eighths, MAX_TIME_THRESHOLD_EIGHTHS);
+            self.min_pkt_num_to_relax = None;
+        }
+    }
+
+    fn pto(&self, pto_base: Duration, pto_count: usize) -> Duration {
+        cmp::min(
+            pto_base * 2_u32.saturating_pow(self.backoff_factor(pto_count)),
+            self.max_pto,
+        )
+    }
+
+    fn pto_with_ack_delay(
+        &self,
+        duration: Duration,
+        max_ack_delay: Duration,
+        pto_count: usize,
+    ) -> Duration {
+        cmp::min(
+            duration + max_ack_delay * 2_u32.saturating_pow(self.backoff_factor(pto_count)),
+            self.max_pto,
+        )
+    }
+}
 
 /// An implementation of the loss detection mechanisms described in
 /// RFC 9002 Section 6 and Appendix A.
@@ -63,11 +235,8 @@ pub struct Recovery {
     /// The validated maximum size of outgoing UDP payloads in bytes.
     pub max_datagram_size: usize,
 
-    /// The endpoint do not backoff the first `pto_linear_factor` consecutive probe timeouts.
-    pto_linear_factor: u64,
-
-    /// Upper limit of probe timeout.
-    max_pto: Duration,
+    /// Loss thresholds and probe timeout computation.
+    loss_detection: Box<dyn LossDetection>,
 
     /// The number of times a PTO has been sent without receiving an
     /// acknowledgment. It is used for PTO calculation.
@@ -76,14 +245,6 @@ pub struct Recovery {
     /// Multi-modal timer used for loss detection. The duration of the timer is
     /// based on the timer's mode, which is set in the packet and timer events.
     loss_detection_timer: Option<Instant>,
-
-    /// Maximum reordering in packets before packet threshold loss detection
-    /// considers a packet lost.
-    pub pkt_thresh: u64,
-
-    /// Maximum reordering in time before time threshold loss detection
-    /// considers a packet lost. Specified as an RTT multiplier.
-    pub time_thresh: f64,
 
     /// The sum of the size in bytes of all sent packets that contain at least
     /// one ack-eliciting or PADDING frame and have not been acknowledged or
@@ -114,6 +275,14 @@ pub struct Recovery {
     /// Path level Statistics.
     pub stats: PathStats,
 
+    /// PMTU black hole detection (RFC 8899 Section 4.3): the largest
+    /// application packet number acknowledged among packets above the base
+    /// PMTU, and the number of such packets sent after it and declared lost.
+    /// A congestion loss burst is followed by acknowledged large packets; a
+    /// black hole is not.
+    largest_acked_large_pkt: Option<u64>,
+    large_lost_after_largest_acked: usize,
+
     /// It tracks the last metrics used for emitting qlog RecoveryMetricsUpdated
     /// event.
     #[cfg(feature = "qlog")]
@@ -123,17 +292,18 @@ pub struct Recovery {
     trace_id: String,
 }
 
+/// Large packets lost after the last acknowledged large one that are taken
+/// as a PMTU black hole.
+const PMTU_BLACK_HOLE_LOST_PACKETS: usize = 6;
+
 impl Recovery {
     pub(super) fn new(conf: &RecoveryConfig) -> Self {
         Recovery {
             max_ack_delay: conf.max_ack_delay,
             max_datagram_size: crate::DEFAULT_SEND_UDP_PAYLOAD_SIZE,
-            pto_linear_factor: conf.pto_linear_factor,
-            max_pto: conf.max_pto,
+            loss_detection: Box::new(Rfc9002::new(conf)),
             pto_count: 0,
             loss_detection_timer: None,
-            pkt_thresh: INITIAL_PACKET_THRESHOLD,
-            time_thresh: INITIAL_TIME_THRESHOLD,
             bytes_in_flight: 0,
             ack_eliciting_in_flight: 0,
             rtt: RttEstimator::new(conf.initial_rtt),
@@ -143,6 +313,8 @@ impl Recovery {
             cache_pkt_size: conf.max_datagram_size,
             last_cwnd_limited_time: None,
             stats: PathStats::default(),
+            largest_acked_large_pkt: None,
+            large_lost_after_largest_acked: 0,
             #[cfg(feature = "qlog")]
             last_metrics: RecoveryMetrics::default(),
             trace_id: String::from(""),
@@ -175,6 +347,9 @@ impl Recovery {
             Some(space) => space,
             None => return,
         };
+        if is_app_data(space_id) {
+            self.loss_detection.on_app_data_sent(pkt.pkt_num);
+        }
         if in_flight {
             // notify congestion controller of the sent event
             if space_id != SpaceId::Initial && space_id != SpaceId::Handshake {
@@ -262,10 +437,14 @@ impl Recovery {
 
         // Detect acked packets
         let mut newly_acked_pkts = Vec::<AckedPacket>::new();
-        let rtt_sample = self.detect_acked_packets(ranges, space, &mut newly_acked_pkts, now);
-        if newly_acked_pkts.is_empty() {
-            return Ok((0, 0));
-        }
+        let mut spuriously_lost = Vec::new();
+        let rtt_sample = self.detect_acked_packets(
+            ranges,
+            space,
+            &mut newly_acked_pkts,
+            &mut spuriously_lost,
+            now,
+        );
 
         // Update RTT estimation
         // TODO: check ack_delay against amx_ack_delay
@@ -283,6 +462,31 @@ impl Recovery {
             if !rtt.is_zero() {
                 self.rtt.update(ack_delay, rtt);
             }
+        }
+
+        if is_app_data(space_id) && !spuriously_lost.is_empty() {
+            // When the peer received them: the ACK left after its ack delay.
+            let received = now - cmp::min(Duration::from_micros(ack_delay), self.max_ack_delay);
+            let losses: Vec<(u64, Duration)> = spuriously_lost
+                .iter()
+                .map(|(pkt_num, time_sent)| (*pkt_num, received.saturating_duration_since(*time_sent)))
+                .collect();
+            for (pkt_num, reordering) in &losses {
+                trace!(
+                    "now={:?} {} {} SPURIOUS_LOSS pn={} time_reordering={:?}",
+                    now,
+                    self.trace_id,
+                    self.congestion.name(),
+                    pkt_num,
+                    reordering
+                );
+            }
+            self.loss_detection
+                .on_spurious_losses(&losses, self.rtt.latest_rtt(), self.rtt.smoothed_rtt());
+        }
+
+        if newly_acked_pkts.is_empty() {
+            return Ok((0, 0));
         }
 
         // Detect lost packets
@@ -308,12 +512,15 @@ impl Recovery {
 
     /// Detect acknowledged packets.
     ///
-    /// It return the latest RTT sample, if any.
+    /// It return the latest RTT sample, if any. Packets acknowledged after
+    /// they were declared lost go to `spuriously_lost` (packet number, time
+    /// sent) instead of `newly_acked`.
     fn detect_acked_packets(
         &mut self,
         ranges: &RangeSet,
         space: &mut PacketNumSpace,
         newly_acked: &mut Vec<AckedPacket>,
+        spuriously_lost: &mut Vec<(u64, Instant)>,
         now: Instant,
     ) -> Option<Duration> {
         let mut largest_newly_acked_pkt_num = 0;
@@ -335,8 +542,15 @@ impl Recovery {
                 }
 
                 sent_pkt.time_acked = Some(now);
-                // TODO: detect spurious retransmissions and increase the
-                // packet or time reordering threshold
+                if sent_pkt.time_lost.is_some() {
+                    // A spurious loss (RFC 9002 Section 6.1). The packet left
+                    // flight and its frames were queued for retransmission
+                    // when it was declared lost; only loss detection learns
+                    // from it.
+                    spuriously_lost.push((sent_pkt.pkt_num, sent_pkt.time_sent));
+                    idx += 1;
+                    continue 'sent_pkt_loop;
+                }
 
                 // TODO: update rtt.
 
@@ -344,6 +558,14 @@ impl Recovery {
                 largest_newly_acked_sent_time = sent_pkt.time_sent;
                 if sent_pkt.ack_eliciting {
                     newly_ack_eliciting_pkt_acked = true
+                }
+                if Self::is_large_app_packet(space.id, sent_pkt)
+                    && self
+                        .largest_acked_large_pkt
+                        .is_none_or(|largest| sent_pkt.pkt_num > largest)
+                {
+                    self.largest_acked_large_pkt = Some(sent_pkt.pkt_num);
+                    self.large_lost_after_largest_acked = 0;
                 }
 
                 if sent_pkt.in_flight {
@@ -434,11 +656,13 @@ impl Recovery {
 
         let mut lost_packets = 0;
         let mut lost_bytes = 0;
+        let mut lost_probe_bytes = 0;
         let mut latest_lost_packet = None;
 
+        let app_data = is_app_data(space.id);
         let loss_delay =
-            cmp::max(self.rtt.latest_rtt(), self.rtt.smoothed_rtt()).mul_f64(self.time_thresh);
-        let loss_delay = cmp::max(loss_delay, TIMER_GRANULARITY);
+            self.loss_detection
+                .loss_delay(self.rtt.latest_rtt(), self.rtt.smoothed_rtt(), app_data);
         let lost_send_time = now - loss_delay;
 
         let unacked_iter = space
@@ -455,14 +679,27 @@ impl Recovery {
             //   acknowledged packet, or it was sent long enough in the past.
             // See RFC 9002 Section 6.1
             if unacked.time_sent <= lost_send_time
-                || unacked.pkt_num + self.pkt_thresh <= space.largest_acked_pkt
+                || self
+                    .loss_detection
+                    .lost_by_reordering(unacked.pkt_num, space.largest_acked_pkt, app_data)
             {
                 space.lost.append(&mut unacked.frames);
                 unacked.time_lost = Some(now);
+                if Self::is_large_app_packet(space.id, unacked)
+                    && !unacked.pmtu_probe
+                    && self
+                        .largest_acked_large_pkt
+                        .is_none_or(|largest| unacked.pkt_num > largest)
+                {
+                    self.large_lost_after_largest_acked += 1;
+                }
 
                 lost_packets += 1;
                 if unacked.in_flight {
                     lost_bytes += unacked.sent_size as u64;
+                    if unacked.pmtu_probe {
+                        lost_probe_bytes += unacked.sent_size as u64;
+                    }
                     space.bytes_in_flight = space.bytes_in_flight.saturating_sub(unacked.sent_size);
                     self.bytes_in_flight = self.bytes_in_flight.saturating_sub(unacked.sent_size);
 
@@ -524,6 +761,10 @@ impl Recovery {
         }
 
         self.stat_lost_event(lost_packets, lost_bytes);
+        self.stats.lost_data_bytes = self
+            .stats
+            .lost_data_bytes
+            .saturating_add(lost_bytes - lost_probe_bytes);
         (lost_packets, lost_bytes)
     }
 
@@ -580,6 +821,29 @@ impl Recovery {
         // PTO timer.
         let (timeout, _) = self.get_pto_time_and_space(space_id, spaces, handshake_status, now);
         self.loss_detection_timer = timeout;
+    }
+
+    /// Consecutive PTOs without an acknowledgment on this path.
+    pub(super) fn pto_count(&self) -> usize {
+        self.pto_count
+    }
+
+    /// An application-data packet above the base PMTU, the only kind a PMTU
+    /// black hole drops.
+    fn is_large_app_packet(space_id: SpaceId, pkt: &SentPacket) -> bool {
+        space_id != SpaceId::Initial
+            && space_id != SpaceId::Handshake
+            && pkt.sent_size > crate::DEFAULT_SEND_UDP_PAYLOAD_SIZE
+    }
+
+    /// Whether large packets keep getting lost while none of them sent since
+    /// is acknowledged: a PMTU black hole. Consumes the evidence.
+    pub(super) fn take_pmtu_black_hole(&mut self) -> bool {
+        if self.large_lost_after_largest_acked < PMTU_BLACK_HOLE_LOST_PACKETS {
+            return false;
+        }
+        self.large_lost_after_largest_acked = 0;
+        true
     }
 
     /// Return expiration time of loss timer
@@ -659,7 +923,14 @@ impl Recovery {
         for unacked in unacked_iter {
             // A PTO timer expiration event does not indicate packet loss and
             // MUST NOT cause prior unacknowledged packets to be marked as lost.
-            space.lost.extend_from_slice(&unacked.frames);
+            // DATAGRAM frames are never retransmitted, so they are skipped.
+            space.lost.extend(
+                unacked
+                    .frames
+                    .iter()
+                    .filter(|f| !matches!(f, frame::Frame::Datagram { .. }))
+                    .cloned(),
+            );
         }
 
         self.set_loss_detection_timer(space_id, spaces, handshake_status, now);
@@ -697,26 +968,19 @@ impl Recovery {
 
     /// Calculate the probe timeout.
     fn calculate_pto(&self) -> Duration {
-        let backoff_factor = self
-            .pto_count
-            .saturating_sub(self.pto_linear_factor as usize);
-
-        cmp::min(
-            self.rtt.pto_base() * 2_u32.saturating_pow(backoff_factor as u32),
-            self.max_pto,
-        )
+        self.loss_detection
+            .pto(self.rtt.pto_base(), self.pto_count)
     }
 
     /// Calculate the probe timeout include `max_ack_delay`.
     fn pto_with_ack_delay(&self, duration: Duration) -> Duration {
-        let backoff_factor = self
-            .pto_count
-            .saturating_sub(self.pto_linear_factor as usize);
+        self.loss_detection
+            .pto_with_ack_delay(duration, self.max_ack_delay, self.pto_count)
+    }
 
-        cmp::min(
-            duration + self.max_ack_delay * 2_u32.saturating_pow(backoff_factor as u32),
-            self.max_pto,
-        )
+    /// Name of the loss detection in use.
+    pub(crate) fn loss_detection_name(&self) -> &'static str {
+        self.loss_detection.name()
     }
 
     /// Return the min pto time and the corresponding space
@@ -841,7 +1105,8 @@ impl Recovery {
             max_datagram_size = cmp::min(self.max_datagram_size, max_datagram_size);
         }
 
-        // TODO: notify CC and pacer
+        // The pacer is handed `max_datagram_size` on every `schedule` call.
+        self.congestion.set_max_datagram_size(max_datagram_size as u64);
 
         self.max_datagram_size = max_datagram_size;
     }
@@ -871,6 +1136,25 @@ impl Recovery {
         }
 
         true
+    }
+
+    /// The connection has nothing more to send on this path. If neither the
+    /// congestion window nor the pacer held it back, the path is
+    /// application-limited (draft-cheng-iccrg-delivery-rate-estimation
+    /// Section 3.4): the congestion controller must not read the delivery
+    /// rate of what is in flight now as the path's bandwidth.
+    pub(crate) fn on_nothing_to_send(&mut self) {
+        let window_limited = self.bytes_in_flight >= self.congestion.congestion_window() as usize;
+        let pacing_limited =
+            self.pacer.enabled() && self.pacer_timer.is_some_and(|t| t > Instant::now());
+        if !window_limited && !pacing_limited {
+            self.congestion.on_app_limited();
+        }
+    }
+
+    /// Whether the pacer allows sending now, ignoring the congestion window.
+    pub(crate) fn can_pace(&mut self) -> bool {
+        !self.pacer.enabled() || self.can_pacing()
     }
 
     fn can_pacing(&mut self) -> bool {
@@ -963,6 +1247,7 @@ impl Recovery {
     /// Update with the latest values from recovery.
     pub(crate) fn stat_lazy_update(&mut self) {
         self.stats.min_rtt = self.rtt.min_rtt().as_micros() as u64;
+        self.stats.windowed_min_rtt = self.rtt.windowed_min_rtt().as_micros() as u64;
         self.stats.max_rtt = self.rtt.max_rtt().as_micros() as u64;
         self.stats.srtt = self.rtt.smoothed_rtt().as_micros() as u64;
         self.stats.rttvar = self.rtt.rttvar().as_micros() as u64;
@@ -1234,6 +1519,52 @@ mod tests {
         assert_eq!(spaces.get(space_id).unwrap().ack_eliciting_in_flight, 0);
         assert_eq!(recovery.ack_eliciting_in_flight, 0);
 
+        Ok(())
+    }
+
+    // Large packets lost while small ones sent after them are acknowledged:
+    // a PMTU black hole. The same losses followed by an acknowledged large
+    // packet are an ordinary loss burst.
+    #[test]
+    fn pmtu_black_hole_needs_losses_after_the_last_acked_large_packet() -> Result<()> {
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+        };
+        for (trailing_size, black_hole) in [(1000, true), (1400, false)] {
+            let conf = new_test_recovery_config();
+            let mut recovery = Recovery::new(&conf);
+            let mut spaces = PacketNumSpaceMap::new();
+            let space_id = SpaceId::Data;
+            let mut now = Instant::now();
+            for pkt_num in 0..10 {
+                let pkt = new_test_sent_packet(pkt_num, 1400, now);
+                recovery.on_packet_sent(pkt, space_id, &mut spaces, status, now);
+            }
+            for pkt_num in 10..14 {
+                let pkt = new_test_sent_packet(pkt_num, trailing_size, now);
+                recovery.on_packet_sent(pkt, space_id, &mut spaces, status, now);
+            }
+
+            now += Duration::from_millis(100);
+            let mut acked = RangeSet::default();
+            acked.insert(10..14);
+            let (lost_pkts, _) = recovery.on_ack_received(
+                &acked,
+                0,
+                space_id,
+                &mut spaces,
+                status,
+                #[cfg(feature = "qlog")]
+                None,
+                now,
+            )?;
+            assert_eq!(lost_pkts, 10);
+            assert_eq!(recovery.take_pmtu_black_hole(), black_hole);
+            // The evidence is consumed.
+            assert!(!recovery.take_pmtu_black_hole());
+        }
         Ok(())
     }
 
@@ -1519,10 +1850,12 @@ mod tests {
         // Fake receiving ACK.
         let ack = generate_ack(vec![500..550, 600..650, 700..750, 800..850, 900..950]);
         let mut newly_acked_pkts = Vec::<AckedPacket>::new();
+        let mut spuriously_lost = Vec::new();
         _ = recovery.detect_acked_packets(
             &ack,
             spaces.get_mut(SpaceId::Data).unwrap(),
             &mut newly_acked_pkts,
+            &mut spuriously_lost,
             now,
         );
         assert!(check_acked_packets(
@@ -1535,6 +1868,7 @@ mod tests {
             &ack,
             spaces.get_mut(SpaceId::Data).unwrap(),
             &mut newly_acked_pkts,
+            &mut spuriously_lost,
             now,
         );
         assert!(check_acked_packets(
@@ -1563,6 +1897,7 @@ mod tests {
             &ack,
             spaces.get_mut(SpaceId::Data).unwrap(),
             &mut newly_acked_pkts,
+            &mut spuriously_lost,
             now,
         );
         assert!(check_acked_packets(
@@ -1576,6 +1911,7 @@ mod tests {
             &ack,
             spaces.get_mut(SpaceId::Data).unwrap(),
             &mut newly_acked_pkts,
+            &mut spuriously_lost,
             now,
         );
         assert!(check_acked_packets(
@@ -1589,12 +1925,14 @@ mod tests {
             &ack,
             spaces.get_mut(SpaceId::Data).unwrap(),
             &mut newly_acked_pkts,
+            &mut spuriously_lost,
             now,
         );
         assert!(check_acked_packets(
             &spaces.get(SpaceId::Data).unwrap().sent,
             vec![100..200, 300..400, 500..1000],
         ));
+        assert!(spuriously_lost.is_empty(), "nothing was declared lost");
 
         Ok(())
     }
@@ -1653,6 +1991,130 @@ mod tests {
 
         let duration = recovery.calculate_pto();
         (duration, recovery.pto_with_ack_delay(duration))
+    }
+
+    #[test]
+    fn rfc9002_loss_thresholds() {
+        let ld = Rfc9002::new(&RecoveryConfig::default());
+        assert_eq!(ld.name(), "tquic-rfc9002");
+        for app_data in [false, true] {
+            // kPacketThreshold = 3
+            assert!(!ld.lost_by_reordering(8, 10, app_data));
+            assert!(ld.lost_by_reordering(7, 10, app_data));
+            // kTimeThreshold = 9/8 of max(latest_rtt, smoothed_rtt)
+            assert_eq!(
+                ld.loss_delay(Duration::from_millis(80), Duration::from_millis(40), app_data),
+                Duration::from_millis(90)
+            );
+            // kGranularity lower bound
+            assert_eq!(
+                ld.loss_delay(Duration::ZERO, Duration::ZERO, app_data),
+                TIMER_GRANULARITY
+            );
+        }
+    }
+
+    /// RFC 9002 Section 6.1, as quic-go does it: a spurious loss ends the
+    /// packet threshold for application data, and reordering that outlasted
+    /// the time threshold doubles it, up to two RTTs. Packets sent before the
+    /// last increase cannot raise it again.
+    #[test]
+    fn rfc9002_spurious_losses_relax_the_app_data_thresholds() {
+        let rtt = Duration::from_millis(80);
+        let mut ld = Rfc9002::new(&RecoveryConfig::default());
+        ld.on_app_data_sent(0);
+
+        // Reordering within the time threshold: only the packet threshold goes.
+        ld.on_spurious_losses(&[(1, Duration::from_millis(85))], rtt, rtt);
+        assert!(!ld.lost_by_reordering(0, 100, true));
+        assert!(ld.lost_by_reordering(0, 100, false), "handshake spaces keep it");
+        assert_eq!(ld.loss_delay(rtt, rtt, true), Duration::from_millis(90));
+
+        // Beyond it: 10/8.
+        ld.on_spurious_losses(&[(2, Duration::from_millis(95))], rtt, rtt);
+        assert_eq!(ld.loss_delay(rtt, rtt, true), Duration::from_millis(100));
+        assert_eq!(ld.loss_delay(rtt, rtt, false), Duration::from_millis(90));
+
+        // A packet sent before that increase cannot raise it again.
+        ld.on_app_data_sent(10);
+        ld.on_spurious_losses(&[(3, Duration::from_millis(150))], rtt, rtt);
+        assert_eq!(ld.loss_delay(rtt, rtt, true), Duration::from_millis(100));
+
+        // Later ones can, up to 16/8.
+        for pkt_num in 10..20 {
+            ld.on_spurious_losses(&[(pkt_num, Duration::from_secs(1))], rtt, rtt);
+            ld.on_app_data_sent(pkt_num + 1);
+        }
+        assert_eq!(ld.loss_delay(rtt, rtt, true), Duration::from_millis(160));
+    }
+
+    /// The trace of 2026-10-14: a small packet overtook queued ones, the
+    /// peer acknowledged it first, and the packets it overtook were declared
+    /// lost though they had arrived. Their late acknowledgment must neither
+    /// take their bytes out of flight a second time nor leave the packet
+    /// threshold to declare the next overtaken packets lost.
+    #[test]
+    fn a_spurious_loss_is_recognized_and_not_repeated() -> Result<()> {
+        let conf = new_test_recovery_config();
+        let mut recovery = Recovery::new(&conf);
+        let mut spaces = PacketNumSpaceMap::new();
+        let space_id = SpaceId::Data;
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+        };
+        let start = Instant::now();
+        let ack = |recovery: &mut Recovery,
+                   spaces: &mut PacketNumSpaceMap,
+                   range: Range<u64>,
+                   now: Instant|
+         -> Result<(u64, u64)> {
+            let mut acked = RangeSet::default();
+            acked.insert(range);
+            recovery.on_ack_received(
+                &acked,
+                0,
+                space_id,
+                spaces,
+                status,
+                #[cfg(feature = "qlog")]
+                None,
+                now,
+            )
+        };
+
+        for pkt_num in 0..5 {
+            let pkt = new_test_sent_packet(pkt_num, 1000, start);
+            recovery.on_packet_sent(pkt, space_id, &mut spaces, status, start);
+        }
+        // 3 and 4 overtook 0..3: 0 and 1 are declared lost by the packet threshold.
+        let now = start + Duration::from_millis(10);
+        assert_eq!(ack(&mut recovery, &mut spaces, 3..5, now)?, (2, 2000));
+        assert_eq!(recovery.bytes_in_flight, 1000, "packet 2 is still in flight");
+
+        // They had arrived: their acknowledgment comes next.
+        let now = start + Duration::from_millis(11);
+        assert_eq!(ack(&mut recovery, &mut spaces, 0..2, now)?, (0, 0));
+        assert_eq!(recovery.bytes_in_flight, 1000, "packet 2 is still in flight");
+        assert_eq!(recovery.stats.lost_count, 2);
+        let now = start + Duration::from_millis(12);
+        assert_eq!(ack(&mut recovery, &mut spaces, 2..3, now)?, (0, 0));
+        assert_eq!(recovery.bytes_in_flight, 0);
+
+        // The same overtaking again is now waited out.
+        let start = start + Duration::from_millis(20);
+        for pkt_num in 5..10 {
+            let pkt = new_test_sent_packet(pkt_num, 1000, start);
+            recovery.on_packet_sent(pkt, space_id, &mut spaces, status, start);
+        }
+        let now = start + Duration::from_millis(10);
+        assert_eq!(ack(&mut recovery, &mut spaces, 8..10, now)?, (0, 0));
+        let now = start + Duration::from_millis(11);
+        assert_eq!(ack(&mut recovery, &mut spaces, 5..8, now)?, (0, 0));
+        assert_eq!(recovery.bytes_in_flight, 0);
+        assert_eq!(recovery.stats.lost_count, 2);
+        Ok(())
     }
 
     #[test]

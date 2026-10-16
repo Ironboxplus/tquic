@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
+
 use bytes::Bytes;
 
 use crate::codec;
@@ -39,6 +44,14 @@ pub(crate) const MAX_STREAM_SIZE: u64 = 1 << 62;
 pub(crate) const MAX_CRYPTO_OVERHEAD: usize = 8;
 // Type (1) + Stream ID (8) + Offset (8) + Length (2)
 pub(crate) const MAX_STREAM_OVERHEAD: usize = 19;
+
+/// OBSERVED_ADDRESS frame types, see draft-ietf-quic-address-discovery.
+pub(crate) const OBSERVED_ADDRESS_V4: u64 = 0x9f81a6;
+pub(crate) const OBSERVED_ADDRESS_V6: u64 = 0x9f81a7;
+
+/// Upper bound of the DATAGRAM frame header written by this implementation:
+/// type (1) + length (8). See RFC 9221.
+pub(crate) const MAX_DATAGRAM_OVERHEAD: usize = 9;
 
 /// The QUIC frame is a unit of structured protocol information. Frames are
 /// contained in QUIC packets.
@@ -178,6 +191,15 @@ pub enum Frame {
         seq_num: u64,
         status: u64,
     },
+
+    /// OBSERVED_ADDRESS frame (types 0x9f81a6 and 0x9f81a7) reports the
+    /// source address the sender observed on the path the frame is carried
+    /// on. See draft-ietf-quic-address-discovery.
+    ObservedAddress { seq_num: u64, addr: SocketAddr },
+
+    /// DATAGRAM frame (types 0x30 and 0x31) carries unreliable application
+    /// data. See RFC 9221.
+    Datagram { data: Bytes },
 }
 
 impl Frame {
@@ -359,6 +381,39 @@ impl Frame {
                 status: b.read_varint()?,
             },
 
+            OBSERVED_ADDRESS_V4 | OBSERVED_ADDRESS_V6 => {
+                let seq_num = b.read_varint()?;
+                let ip = if frame_type == OBSERVED_ADDRESS_V4 {
+                    let octets: [u8; 4] =
+                        b.read(4)?.try_into().map_err(|_| Error::BufferTooShort)?;
+                    IpAddr::V4(Ipv4Addr::from(octets))
+                } else {
+                    let octets: [u8; 16] =
+                        b.read(16)?.try_into().map_err(|_| Error::BufferTooShort)?;
+                    IpAddr::V6(Ipv6Addr::from(octets))
+                };
+                let port = b.read_u16()?;
+                Frame::ObservedAddress {
+                    seq_num,
+                    addr: SocketAddr::new(ip, port),
+                }
+            }
+
+            0x30..=0x31 => {
+                let length = if frame_type == 0x31 {
+                    b.read_varint()? as usize
+                } else {
+                    b.len()
+                };
+                if length > b.len() {
+                    return Err(Error::BufferTooShort);
+                }
+                let start = buf.len() - b.len();
+                let data = buf.slice(start..(start + length));
+                b.skip(length)?;
+                Frame::Datagram { data }
+            }
+
             _ => return Err(Error::FrameEncodingError),
         };
 
@@ -383,6 +438,8 @@ impl Frame {
             (PacketType::ZeroRTT, Frame::PathResponse { .. }) => false,
             (PacketType::ZeroRTT, Frame::RetireConnectionId { .. }) => false,
             (PacketType::ZeroRTT, Frame::ConnectionClose { .. }) => false,
+            // OBSERVED_ADDRESS describes a validated path; 1-RTT only.
+            (PacketType::ZeroRTT, Frame::ObservedAddress { .. }) => false,
 
             // ACK, CRYPTO and CONNECTION_CLOSE can be sent on all other packet
             // types.
@@ -609,6 +666,29 @@ impl Frame {
                 b.write_varint(*seq_num)?;
                 b.write_varint(*status)?;
             }
+
+            Frame::ObservedAddress { seq_num, addr } => {
+                match addr.ip() {
+                    IpAddr::V4(ip) => {
+                        b.write_varint(OBSERVED_ADDRESS_V4)?;
+                        b.write_varint(*seq_num)?;
+                        b.write(&ip.octets())?;
+                    }
+                    IpAddr::V6(ip) => {
+                        b.write_varint(OBSERVED_ADDRESS_V6)?;
+                        b.write_varint(*seq_num)?;
+                        b.write(&ip.octets())?;
+                    }
+                }
+                b.write_u16(addr.port())?;
+            }
+
+            Frame::Datagram { data, .. } => {
+                // Always encode the length so that other frames may follow.
+                b.write_varint(0x31)?;
+                b.write_varint(data.len() as u64)?;
+                b.write(data.as_ref())?;
+            }
         }
 
         Ok(len - b.len())
@@ -766,6 +846,16 @@ impl Frame {
                 4 + codec::encode_varint_len(*dcid_seq_num)
                     + codec::encode_varint_len(*seq_num)
                     + codec::encode_varint_len(*status)
+            }
+
+            Frame::ObservedAddress { seq_num, addr } => {
+                let ip_len = if addr.is_ipv4() { 4 } else { 16 };
+                // length of frame type (0x9f81a6/0x9f81a7) is 4
+                4 + codec::encode_varint_len(*seq_num) + ip_len + 2
+            }
+
+            Frame::Datagram { data, .. } => {
+                1 + codec::encode_varint_len(data.len() as u64) + data.len()
             }
         }
     }
@@ -931,6 +1021,21 @@ impl Frame {
             Frame::PathStatus { .. } => QuicFrame::Unknown {
                 raw_frame_type: 0x15228c06,
                 frame_type_value: None,
+                raw: None,
+            },
+
+            Frame::ObservedAddress { addr, .. } => QuicFrame::Unknown {
+                raw_frame_type: if addr.is_ipv4() {
+                    OBSERVED_ADDRESS_V4
+                } else {
+                    OBSERVED_ADDRESS_V6
+                },
+                frame_type_value: None,
+                raw: None,
+            },
+
+            Frame::Datagram { data, .. } => QuicFrame::Datagram {
+                length: data.len() as u64,
                 raw: None,
             },
         }
@@ -1111,6 +1216,14 @@ impl std::fmt::Debug for Frame {
                     f,
                     "PATH_STATUS dcid_seq_num={dcid_seq_num:x} seq_num={seq_num:x} status={status:x}",
                 )?;
+            }
+
+            Frame::ObservedAddress { seq_num, addr } => {
+                write!(f, "OBSERVED_ADDRESS seq_num={seq_num} addr={addr}")?;
+            }
+
+            Frame::Datagram { data, .. } => {
+                write!(f, "DATAGRAM len={}", data.len())?;
             }
         }
 
@@ -1772,6 +1885,125 @@ mod tests {
         assert!(Frame::from_bytes(&mut buf, PacketType::Initial).is_err());
         assert!(Frame::from_bytes(&mut buf, PacketType::Handshake).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn observed_address_v4() -> Result<()> {
+        let frame = Frame::ObservedAddress {
+            seq_num: 3,
+            addr: "203.0.113.7:4433".parse().unwrap(),
+        };
+        assert_eq!(
+            format!("{:?}", &frame),
+            "OBSERVED_ADDRESS seq_num=3 addr=203.0.113.7:4433"
+        );
+
+        let mut buf = [0; 128];
+        let len = frame.to_bytes(&mut buf[..])?;
+        assert_eq!(len, frame.wire_len());
+        assert_eq!(len, 4 + 1 + 4 + 2);
+
+        let mut buf = Bytes::copy_from_slice(&buf[..len]);
+        assert_eq!(
+            (frame, len),
+            Frame::from_bytes(&mut buf, PacketType::OneRTT)?
+        );
+        assert!(Frame::from_bytes(&mut buf, PacketType::ZeroRTT).is_err());
+        assert!(Frame::from_bytes(&mut buf, PacketType::Initial).is_err());
+        assert!(Frame::from_bytes(&mut buf, PacketType::Handshake).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn observed_address_v6() -> Result<()> {
+        let frame = Frame::ObservedAddress {
+            seq_num: 70000,
+            addr: "[2001:db8::1]:65535".parse().unwrap(),
+        };
+
+        let mut buf = [0; 128];
+        let len = frame.to_bytes(&mut buf[..])?;
+        assert_eq!(len, frame.wire_len());
+        assert_eq!(len, 4 + 4 + 16 + 2);
+
+        let mut buf = Bytes::copy_from_slice(&buf[..len]);
+        assert_eq!(
+            (frame, len),
+            Frame::from_bytes(&mut buf, PacketType::OneRTT)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_address_truncated() {
+        let frame = Frame::ObservedAddress {
+            seq_num: 0,
+            addr: "[2001:db8::1]:1".parse().unwrap(),
+        };
+        let mut buf = [0; 128];
+        let len = frame.to_bytes(&mut buf[..]).unwrap();
+        let mut buf = Bytes::copy_from_slice(&buf[..len - 3]);
+        assert!(Frame::from_bytes(&mut buf, PacketType::OneRTT).is_err());
+    }
+
+    #[test]
+    fn datagram_with_length() -> Result<()> {
+        let data = Bytes::from_static(b"unreliable payload");
+        let frame = Frame::Datagram { data: data.clone() };
+        assert_eq!(format!("{:?}", &frame), "DATAGRAM len=18");
+
+        let mut buf = [0; 128];
+        let len = frame.to_bytes(&mut buf[..])?;
+        assert_eq!(len, frame.wire_len());
+        assert_eq!(len, 1 + 1 + 18);
+
+        let mut buf = Bytes::copy_from_slice(&buf[..len]);
+        assert_eq!(
+            (Frame::Datagram { data }, len),
+            Frame::from_bytes(&mut buf, PacketType::OneRTT)?
+        );
+        assert!(Frame::from_bytes(&mut buf, PacketType::ZeroRTT).is_ok());
+        assert!(Frame::from_bytes(&mut buf, PacketType::Initial).is_err());
+        assert!(Frame::from_bytes(&mut buf, PacketType::Handshake).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn datagram_without_length_extends_to_packet_end() -> Result<()> {
+        let mut raw = vec![0x30];
+        raw.extend_from_slice(b"tail");
+        let mut buf = Bytes::from(raw);
+        let (frame, len) = Frame::from_bytes(&mut buf, PacketType::OneRTT)?;
+        assert_eq!(len, 5);
+        assert_eq!(
+            frame,
+            Frame::Datagram {
+                data: Bytes::from_static(b"tail"),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn datagram_length_beyond_buffer() {
+        let mut buf = Bytes::from(vec![0x31, 0x05, 0x01, 0x02]);
+        assert_eq!(
+            Frame::from_bytes(&mut buf, PacketType::OneRTT),
+            Err(Error::BufferTooShort)
+        );
+    }
+
+    #[test]
+    fn datagram_and_observed_address_elicit_acks() {
+        let dgram = Frame::Datagram { data: Bytes::new() };
+        let observed = Frame::ObservedAddress {
+            seq_num: 0,
+            addr: "192.0.2.1:1".parse().unwrap(),
+        };
+        assert!(dgram.ack_eliciting());
+        assert!(!dgram.probing());
+        assert!(observed.ack_eliciting());
+        assert!(!observed.probing());
     }
 
     #[test]

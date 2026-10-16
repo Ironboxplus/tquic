@@ -92,7 +92,9 @@ pub const QUIC_VERSION_V1: u32 = 0x0000_0001;
 pub const MAX_CID_LEN: usize = 20;
 
 /// Max number of cid that are allowed to advertised to the peer.
-const MAX_CID_LIMIT: u64 = 8;
+/// Each multipath path consumes one: 16 lets a multi-WAN host keep its
+/// punched paths, per-NIC paths and relay paths in one connection.
+const MAX_CID_LIMIT: u64 = 16;
 
 /// The Stateless Reset Token is a 16-byte value.
 const RESET_TOKEN_LEN: usize = 16;
@@ -286,6 +288,10 @@ pub struct PacketSendMeta {
     /// declared lost by QUIC recovery. Multipath duplicate/buffered copies do
     /// not set this flag merely because they were queued internally.
     pub contains_retransmission: bool,
+    /// The flow every DATAGRAM frame in this packet belongs to, as given to
+    /// `Connection::dgram_send_with_flow`. `None` for any packet that holds
+    /// something else (STREAM frames, datagrams without a flow, a mix).
+    pub flow_hash: Option<u32>,
 }
 
 impl PacketSendMeta {
@@ -390,6 +396,19 @@ pub struct Config {
 
     /// Find TLS config according to server name.
     tls_config_selector: Option<Arc<dyn tls::TlsConfigSelector>>,
+
+    /// Bytes of received datagrams buffered until the application reads them.
+    datagram_recv_buffer_size: usize,
+
+    /// Bytes of datagrams queued for sending.
+    datagram_send_buffer_size: usize,
+
+    /// Whether datagrams may exceed the congestion window and the pacer
+    /// (RFC 9484 Section 10.2). A circuit breaker turns this off again.
+    datagram_bypass_cwnd: bool,
+
+    /// Whether that circuit breaker may trip.
+    datagram_bypass_breaker: bool,
 }
 
 impl Config {
@@ -439,6 +458,10 @@ impl Config {
             recovery: RecoveryConfig::default(),
             multipath: MultipathConfig::default(),
             tls_config_selector: None,
+            datagram_recv_buffer_size: 1_250_000,
+            datagram_send_buffer_size: 1024 * 1024,
+            datagram_bypass_cwnd: false,
+            datagram_bypass_breaker: true,
         })
     }
 
@@ -675,16 +698,55 @@ impl Config {
         self.local_transport_params.enable_multipath = v;
     }
 
+    /// Set the `max_datagram_frame_size` transport parameter (RFC 9221).
+    /// The default value is 0, which means the parameter is not advertised
+    /// and DATAGRAM frames are neither sent nor accepted.
+    pub fn set_max_datagram_frame_size(&mut self, v: u64) {
+        self.local_transport_params.max_datagram_frame_size = match v {
+            0 => None,
+            v => Some(cmp::min(v, VINT_MAX)),
+        };
+    }
+
+    /// Set the receive and send queue sizes of datagrams in bytes.
+    /// The default values are 1250000 and 1048576.
+    pub fn set_datagram_buffer_sizes(&mut self, recv: usize, send: usize) {
+        self.datagram_recv_buffer_size = recv;
+        self.datagram_send_buffer_size = send;
+    }
+
+    /// Let datagrams exceed the congestion window and the pacer (RFC 9484
+    /// Section 10.2): they wait in the sender's queue below QUIC instead. A
+    /// circuit breaker (RFC 8084) puts them back under the congestion window
+    /// after sustained loss, see `enable_datagram_bypass_breaker`.
+    /// The default value is false.
+    pub fn enable_datagram_bypass_cwnd(&mut self, v: bool) {
+        self.datagram_bypass_cwnd = v;
+    }
+
+    /// Let the circuit breaker of the datagram bypass (RFC 8084) trip after
+    /// sustained loss, putting datagrams back under the congestion window.
+    /// Turn it off only when a shaper below QUIC already bounds the sending
+    /// rate (EasyTier's CAKE): its AQM drops then read as loss, and the
+    /// tripped breaker would queue datagrams inside QUIC instead.
+    /// The default value is true.
+    pub fn enable_datagram_bypass_breaker(&mut self, v: bool) {
+        self.datagram_bypass_breaker = v;
+    }
+
+    /// Advertise the address discovery extension
+    /// (draft-ietf-quic-address-discovery) in both directions: report the
+    /// peer's address on each path and accept reports of ours.
+    /// The default value is false.
+    pub fn enable_address_discovery(&mut self, v: bool) {
+        self.local_transport_params.address_discovery =
+            v.then_some(trans_param::ADDRESS_DISCOVERY_BOTH);
+    }
+
     /// Set the multipath scheduling algorithm
     /// The default value is MultipathAlgorithm::MinRtt
     pub fn set_multipath_algorithm(&mut self, v: MultipathAlgorithm) {
         self.multipath.multipath_algorithm = v;
-    }
-
-    /// Set the SQM-weighted scheduler latency/bandwidth slider.
-    /// Values are clamped to `[0, 1]` and ignored by other schedulers.
-    pub fn set_multipath_sqm_lambda(&mut self, v: f64) {
-        self.multipath.sqm_lambda = v.clamp(0.0, 1.0);
     }
 
     /// Set the maximum size of the connection flow control window.
@@ -961,16 +1023,12 @@ impl Default for RecoveryConfig {
 pub struct MultipathConfig {
     /// Multipath scheduling algorithm.
     multipath_algorithm: MultipathAlgorithm,
-
-    /// SQM-weighted scheduler latency/bandwidth slider.
-    sqm_lambda: f64,
 }
 
 impl Default for MultipathConfig {
     fn default() -> MultipathConfig {
         MultipathConfig {
             multipath_algorithm: MultipathAlgorithm::MinRtt,
-            sqm_lambda: 1.0,
         }
     }
 }
@@ -1104,6 +1162,9 @@ pub trait TransportHandler {
 
     /// Called when client receives a token in NEW_TOKEN frame.
     fn on_new_token(&mut self, conn: &mut Connection, token: Vec<u8>);
+
+    /// Called when new datagrams can be read with `Connection::dgram_recv`.
+    fn on_datagram_readable(&mut self, _conn: &mut Connection) {}
 }
 
 /// The PacketSendHandler lists the callbacks used by the endpoint to
@@ -1187,6 +1248,41 @@ pub enum PathEvent {
     Abandoned(usize),
 }
 
+/// A change in the life of a path, as noq's `PathEvent`. `serial` identifies
+/// the path itself: a 4-tuple opened again later is a new path with a new
+/// serial, so events of the old path are told apart from the new one's.
+/// See `Connection::take_path_events`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathLifecycleEvent {
+    /// The path was created (`add_path`, or the peer's first packet on it).
+    Opened {
+        local: SocketAddr,
+        remote: SocketAddr,
+        serial: u64,
+    },
+
+    /// The path will carry no more data: abandoned by the application
+    /// (`by_peer` false) or because of the peer (its PATH_ABANDON, or its
+    /// opening a new path on the same 4-tuple).
+    Abandoned {
+        local: SocketAddr,
+        remote: SocketAddr,
+        serial: u64,
+        scid_seq: Option<u64>,
+        dcid_seq: Option<u64>,
+        by_peer: bool,
+    },
+
+    /// The abandoned path has drained and was dropped.
+    Discarded {
+        local: SocketAddr,
+        remote: SocketAddr,
+        serial: u64,
+        scid_seq: Option<u64>,
+        dcid_seq: Option<u64>,
+    },
+}
+
 /// High-level state of a model-based congestion controller.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1255,6 +1351,11 @@ pub struct PathStats {
     /// Minimum roundtrip time in microseconds.
     pub min_rtt: u64,
 
+    /// The path's propagation delay in microseconds: the smallest roundtrip
+    /// time of the last 10 seconds (BBR's min_rtt filter). Unlike `min_rtt`
+    /// it follows a route change, and unlike `srtt` it holds no queueing.
+    pub windowed_min_rtt: u64,
+
     /// Maximum roundtrip time in microseconds.
     pub max_rtt: u64,
 
@@ -1304,6 +1405,17 @@ pub struct PathStats {
 
     /// Record the total number of times the PTO is triggered on this path
     pub pto_count: u64,
+
+    /// Our address on this path as observed and reported by the peer
+    /// (draft-ietf-quic-address-discovery), if any.
+    pub observed_local_addr: Option<SocketAddr>,
+
+    /// Lost bytes excluding PMTU probes: probes are sized to be lost when
+    /// they exceed the path MTU, so their loss says nothing about the path.
+    pub lost_data_bytes: u64,
+
+    /// Time since a packet last arrived on the path, in microseconds.
+    pub idle_time: u64,
 }
 
 #[cfg(test)]
@@ -1390,10 +1502,11 @@ pub use crate::congestion_control::CongestionControlAlgorithm;
 pub use crate::connection::path::Path;
 pub use crate::connection::path::PathState;
 pub use crate::connection::Connection;
+pub use crate::connection::DatagramStats;
+pub use crate::connection::SendDatagramError;
 pub use crate::endpoint::Endpoint;
 pub use crate::error::Error;
-pub use crate::multipath_scheduler::available_schedulers;
-pub use crate::multipath_scheduler::MultipathAlgorithm;
+pub use crate::multipath_scheduler::available_schedulers;pub use crate::multipath_scheduler::MultipathAlgorithm;
 pub use crate::multipath_scheduler::SchedulerInfo;
 pub use crate::multipath_scheduler::SchedulerTunable;
 pub use crate::multipath_scheduler::TunableKind;

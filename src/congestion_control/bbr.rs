@@ -1108,11 +1108,122 @@ impl CongestionController for Bbr {
             },
         })
     }
+
+    fn on_app_limited(&mut self) {
+        self.delivery_rate_estimator.set_app_limited(true);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends `n` packets of `size` bytes `gap` apart from `start` and acks
+    /// them all `rtt` after the last one, in one ACK. Returns the ack time.
+    fn send_and_ack_flight(
+        bbr: &mut Bbr,
+        next_pkt_num: &mut u64,
+        start: Instant,
+        n: u64,
+        size: u64,
+        gap: Duration,
+        rtt: Duration,
+    ) -> Instant {
+        let mut pkts = Vec::new();
+        for i in 0..n {
+            let sent = start + gap * i as u32;
+            let mut packet = SentPacket {
+                pkt_num: *next_pkt_num,
+                time_sent: sent,
+                ack_eliciting: true,
+                in_flight: true,
+                sent_size: size as usize,
+                ..SentPacket::default()
+            };
+            *next_pkt_num += 1;
+            bbr.on_sent(sent, &mut packet, bbr.stats.bytes_in_flight);
+            pkts.push(packet);
+        }
+        let acked = start + gap * n.saturating_sub(1) as u32 + rtt;
+        let rtt_estimator = RttEstimator::new(rtt);
+        bbr.begin_ack(acked, bbr.stats.bytes_in_flight);
+        for packet in pkts.iter_mut() {
+            packet.time_acked = Some(acked);
+            bbr.on_ack(packet, acked, false, &rtt_estimator, 0);
+        }
+        bbr.end_ack();
+        acked
+    }
+
+    /// A connection that goes quiet but keeps a keep-alive PING going must
+    /// keep its bandwidth estimate: each PING's tiny delivery rate is an
+    /// application-limited sample once the sender reports it had nothing else
+    /// to send. Without that report, ten rounds of PINGs replace the
+    /// estimate with the PING rate, and the next transfer starts from about
+    /// 1 KB/s -- the stall seen over a cellular uplink after idle periods.
+    #[test]
+    fn keepalive_samples_while_app_limited_keep_the_bandwidth_estimate() {
+        for report_app_limited in [true, false] {
+            let mut bbr = Bbr::new(BbrConfig::default());
+            let mut pkt_num = 0;
+            let rtt = Duration::from_millis(50);
+            let mut now = Instant::now();
+            // Bulk: 40 x 1200 B per round, about 480 KB/s delivered.
+            for _ in 0..20 {
+                now = send_and_ack_flight(
+                    &mut bbr,
+                    &mut pkt_num,
+                    now,
+                    40,
+                    1200,
+                    Duration::from_micros(1250),
+                    rtt,
+                );
+            }
+            let bulk_btlbw = bbr.btlbw;
+            assert!(bulk_btlbw > 300_000, "bulk estimate {bulk_btlbw}");
+
+            // Idle: one 60 B PING per second for 30 s.
+            for _ in 0..30 {
+                now += Duration::from_secs(1);
+                if report_app_limited {
+                    bbr.on_app_limited();
+                }
+                now = send_and_ack_flight(&mut bbr, &mut pkt_num, now, 1, 60, Duration::ZERO, rtt);
+            }
+            if report_app_limited {
+                assert_eq!(bbr.btlbw, bulk_btlbw, "the PINGs must not replace the estimate");
+            } else {
+                assert!(
+                    bbr.btlbw < 10_000,
+                    "unreported idle PINGs collapse the estimate (got {})",
+                    bbr.btlbw
+                );
+            }
+        }
+    }
+
+    /// A sender limited by its window is not application-limited: its
+    /// samples still lower the estimate when the path slows down.
+    #[test]
+    fn samples_after_the_app_limited_flight_is_acked_count_again() {
+        let mut bbr = Bbr::new(BbrConfig::default());
+        let mut pkt_num = 0;
+        let rtt = Duration::from_millis(50);
+        let mut now = Instant::now();
+        for _ in 0..20 {
+            now = send_and_ack_flight(&mut bbr, &mut pkt_num, now, 40, 1200, Duration::from_micros(1250), rtt);
+        }
+        let bulk_btlbw = bbr.btlbw;
+        bbr.on_app_limited();
+        now = send_and_ack_flight(&mut bbr, &mut pkt_num, now, 1, 60, Duration::ZERO, rtt);
+        assert_eq!(bbr.btlbw, bulk_btlbw);
+        // The path drops to a tenth: 4 packets per round, not app-limited.
+        for _ in 0..30 {
+            now = send_and_ack_flight(&mut bbr, &mut pkt_num, now, 4, 1200, Duration::from_micros(12_500), rtt);
+        }
+        assert!(bbr.btlbw < bulk_btlbw / 4, "{} vs {bulk_btlbw}", bbr.btlbw);
+    }
 
     #[test]
     fn bbr_exposes_raw_bandwidth_metrics() {

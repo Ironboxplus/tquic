@@ -21,6 +21,7 @@ use self::scheduler_minrtt::*;
 use self::scheduler_redundant::*;
 use self::scheduler_rr::*;
 use self::scheduler_sqm::*;
+pub(crate) use self::scheduler_sqm::ecf_place;
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::space::SentPacket;
@@ -192,7 +193,9 @@ static SQM_TUNABLES: &[SchedulerTunable] = &[SchedulerTunable {
         max: 1.0,
         step: 0.01,
     },
-    default: scheduler_sqm::DEFAULT_LAMBDA,
+    // The slider is EasyTier's optimizer setting (`mp.lambda`): which paths
+    // get traffic. The scheduler itself fills paths by delay (S-I5/I6).
+    default: 1.0,
     help: "0 = lowest latency (single best path); 1 = maximum bandwidth (weighted striping across all paths).",
 }];
 
@@ -283,6 +286,12 @@ pub(crate) mod tests {
         pub(crate) fn set_path_active(&mut self, path_id: usize, active: bool) -> Result<()> {
             let path = self.paths.get_mut(path_id)?;
             path.set_active(active);
+            Ok(())
+        }
+
+        /// Mark the given path as standby or not.
+        pub(crate) fn set_path_standby(&mut self, path_id: usize, standby: bool) -> Result<()> {
+            self.paths.get_mut(path_id)?.set_standby(standby);
             Ok(())
         }
     }

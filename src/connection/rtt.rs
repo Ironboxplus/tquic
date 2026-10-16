@@ -14,8 +14,15 @@
 
 use std::cmp;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::TIMER_GRANULARITY;
+
+/// How long a sample stays the path's propagation delay estimate
+/// (`windowed_min_rtt`): BBR's `MinRTTFilterLen`
+/// (draft-cardwell-iccrg-bbr-congestion-control, 10 s). The lifetime minimum
+/// of RFC 9002 Section 5.2 never forgets a route that is gone.
+pub const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
 
 /// RTT estimation for a network path
 /// See RFC 9001 Section 5
@@ -37,6 +44,9 @@ pub struct RttEstimator {
 
     /// The maximum RTT observed on the path, ignoring ack delay.
     max_rtt: Duration,
+
+    /// The smallest sample of the last `MIN_RTT_WINDOW` and when it was taken.
+    windowed_min_rtt: Option<(Duration, Instant)>,
 }
 
 /// An statistical description of the network path's RTT
@@ -48,6 +58,7 @@ impl RttEstimator {
             rttvar: initial_rtt / 2,
             min_rtt: initial_rtt,
             max_rtt: initial_rtt,
+            windowed_min_rtt: None,
         }
     }
 
@@ -64,6 +75,14 @@ impl RttEstimator {
     /// Return the Minimum RTT observed so far for this estimator.
     pub fn min_rtt(&self) -> Duration {
         self.min_rtt
+    }
+
+    /// The path's propagation delay: the smallest RTT sample of the last
+    /// `MIN_RTT_WINDOW`, without the queueing that `smoothed_rtt` includes.
+    /// The initial RTT until the first sample.
+    pub fn windowed_min_rtt(&self) -> Duration {
+        self.windowed_min_rtt
+            .map_or(self.latest_rtt, |(rtt, _)| rtt)
     }
 
     /// Return the variation in the RTT samples using a mean variation.
@@ -104,6 +123,19 @@ impl RttEstimator {
 
     /// Update estimator with the given RTT sample
     pub fn update(&mut self, ack_delay: Duration, rtt: Duration) {
+        self.update_at(ack_delay, rtt, Instant::now())
+    }
+
+    fn update_at(&mut self, ack_delay: Duration, rtt: Duration, now: Instant) {
+        // As BBR's min_rtt filter: a sample replaces the estimate when it is
+        // no larger, or when the estimate has outlived the window.
+        let replace = self.windowed_min_rtt.map_or(true, |(min, at)| {
+            rtt <= min || now.saturating_duration_since(at) > MIN_RTT_WINDOW
+        });
+        if replace {
+            self.windowed_min_rtt = Some((rtt, now));
+        }
+
         self.latest_rtt = rtt;
         self.min_rtt = cmp::min(self.min_rtt, self.latest_rtt);
         self.max_rtt = cmp::max(self.max_rtt, self.latest_rtt);
@@ -206,5 +238,26 @@ mod tests {
         assert_eq!(r.rttvar(), time::Duration::from_millis(200));
         assert_eq!(r.smoothed_rtt(), time::Duration::from_millis(400));
         assert_eq!(r.pto_base(), time::Duration::from_millis(1200));
+    }
+
+    #[test]
+    fn windowed_min_rtt_forgets_a_minimum_older_than_the_window() {
+        let ms = time::Duration::from_millis;
+        let t0 = Instant::now();
+        let mut r = RttEstimator::new(ms(333));
+        assert_eq!(r.windowed_min_rtt(), ms(333));
+
+        r.update_at(ms(0), ms(20), t0);
+        r.update_at(ms(0), ms(150), t0 + ms(1_000));
+        assert_eq!(r.windowed_min_rtt(), ms(20));
+        assert_eq!(r.min_rtt(), ms(20));
+
+        // The route changed: every sample is now 80 ms. The lifetime minimum
+        // stays at 20 ms, the windowed one moves once 20 ms is too old.
+        r.update_at(ms(0), ms(80), t0 + ms(5_000));
+        assert_eq!(r.windowed_min_rtt(), ms(20));
+        r.update_at(ms(0), ms(80), t0 + MIN_RTT_WINDOW + ms(1));
+        assert_eq!(r.windowed_min_rtt(), ms(80));
+        assert_eq!(r.min_rtt(), ms(20));
     }
 }
