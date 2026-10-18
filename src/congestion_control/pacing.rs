@@ -46,6 +46,10 @@ pub struct Pacer {
     /// available tokens, bytes
     tokens: u64,
 
+    /// Sub-byte credit, in billionths of a byte. Frequent polling must not
+    /// discard elapsed time before it earns a whole token.
+    refill_remainder: u64,
+
     /// last congestion window, bytes
     last_cwnd: u64,
 
@@ -70,6 +74,7 @@ impl Pacer {
             enabled,
             capacity: 0,
             tokens: 0,
+            refill_remainder: 0,
             last_cwnd: cwnd,
             last_sched_time: now,
             granularity,
@@ -129,17 +134,21 @@ impl Pacer {
             self.last_cwnd = cwnd;
         }
 
-        // If tokens are enough, no need to wait and update
-        if self.tokens >= bytes_to_send {
-            return None;
-        }
-
-        // Tokens are refilled at the rate of pacing_rate
+        // Account for elapsed time even when the bucket is already full, so
+        // time spent at capacity cannot be credited again after a burst.
+        // Quinn's pacer likewise retains time when a poll earns no whole byte.
+        // Fixed-point credit also preserves the remainder of nonzero refills.
         let elapsed = now.saturating_duration_since(self.last_sched_time);
+        let credit = pacing_rate as u128 * elapsed.as_nanos() + self.refill_remainder as u128;
         self.tokens = self
             .tokens
-            .saturating_add((pacing_rate as u128 * elapsed.as_nanos() / 1_000_000_000) as u64)
+            .saturating_add((credit / 1_000_000_000).min(u64::MAX as u128) as u64)
             .min(self.capacity);
+        self.refill_remainder = if self.tokens == self.capacity {
+            0
+        } else {
+            (credit % 1_000_000_000) as u64
+        };
         self.last_sched_time = now;
 
         if bytes_to_send <= self.tokens {
@@ -147,9 +156,10 @@ impl Pacer {
         }
 
         // If tokens are not enough, calculate the time to wait for enough tokens.
-        let time_to_wait =
-            bytes_to_send.saturating_sub(self.tokens) * 1_000_000_000 / pacing_rate.max(1);
-        Some(self.last_sched_time + Duration::from_nanos(time_to_wait))
+        let missing_credit = (bytes_to_send - self.tokens) as u128 * 1_000_000_000
+            - self.refill_remainder as u128;
+        let time_to_wait = missing_credit.div_ceil(pacing_rate as u128).min(u64::MAX as u128);
+        Some(self.last_sched_time + Duration::from_nanos(time_to_wait as u64))
     }
 
     fn update_capacity(&mut self, cwnd: u64, srtt: Duration, mtu: u64) {
@@ -214,6 +224,51 @@ mod tests {
         assert_eq!(next_sched_time, None);
         p.on_sent(bytes_to_send);
         assert_eq!(p.capacity, p.tokens);
+    }
+
+    #[test]
+    fn frequent_polls_preserve_low_rate_credit() {
+        let now = Instant::now();
+        let srtt = Duration::from_millis(1);
+        let mtu = 1200;
+        let cwnd = 2400;
+        let rate = 300;
+        let mut frequent = Pacer::new(true, srtt, cwnd, mtu, now, PACING_GRANULARITY);
+        frequent.on_sent(frequent.capacity);
+        for millis in 1..4000 {
+            assert!(frequent
+                .schedule(mtu, rate, srtt, cwnd, mtu, now + Duration::from_millis(millis))
+                .is_some());
+        }
+        assert_eq!(
+            frequent.schedule(mtu, rate, srtt, cwnd, mtu, now + Duration::from_secs(4)),
+            None,
+            "polling faster than one byte is earned must not erase accumulated credit"
+        );
+        let mut single = Pacer::new(true, srtt, cwnd, mtu, now, PACING_GRANULARITY);
+        single.on_sent(single.capacity);
+        assert_eq!(
+            single.schedule(mtu, rate, srtt, cwnd, mtu, now + Duration::from_secs(4)),
+            None
+        );
+        assert_eq!(frequent.tokens, single.tokens);
+    }
+
+    #[test]
+    fn time_at_capacity_is_not_credited_twice() {
+        let now = Instant::now();
+        let srtt = Duration::from_millis(1);
+        let mtu = 1200;
+        let cwnd = 2400;
+        let rate = 300;
+        let later = now + Duration::from_secs(100);
+        let mut pacer = Pacer::new(true, srtt, cwnd, mtu, now, PACING_GRANULARITY);
+        assert_eq!(pacer.schedule(mtu, rate, srtt, cwnd, mtu, later), None);
+        pacer.on_sent(pacer.capacity);
+        assert_eq!(
+            pacer.schedule(mtu, rate, srtt, cwnd, mtu, later),
+            Some(later + Duration::from_secs(4))
+        );
     }
 
     #[test]
