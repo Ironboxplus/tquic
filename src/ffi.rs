@@ -2049,6 +2049,7 @@ impl From<&PacketInfo<'_>> for crate::PacketInfo {
             time: Instant::now(),
             // The C ABI predates composition metadata. Incoming packets have
             // no send-side semantics; outbound Rust composition fills it.
+            recv_timestamp: None,
             send_meta: crate::PacketSendMeta::default(),
         }
     }

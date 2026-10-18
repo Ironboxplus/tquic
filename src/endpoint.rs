@@ -384,6 +384,7 @@ impl Endpoint {
             src: local,
             dst: remote,
             time: Instant::now(),
+            recv_timestamp: None,
             send_meta: crate::PacketSendMeta::default(),
         };
 
@@ -426,6 +427,7 @@ impl Endpoint {
             src: local,
             dst: remote,
             time: Instant::now(),
+            recv_timestamp: None,
             send_meta: crate::PacketSendMeta::default(),
         };
 
@@ -476,6 +478,7 @@ impl Endpoint {
             src: local,
             dst: remote,
             time: Instant::now(),
+            recv_timestamp: None,
             send_meta: crate::PacketSendMeta::default(),
         };
 
@@ -1432,6 +1435,7 @@ mod tests {
                     src: remote,
                     dst: s.socket.local_addr().unwrap(),
                     time: Instant::now(),
+                    recv_timestamp: None,
                     send_meta: crate::PacketSendMeta::default(),
                 };
                 match e.recv(pkt_buf, &pkt_info) {
@@ -2939,6 +2943,7 @@ mod tests {
             src: addr,
             dst: addr,
             time: Instant::now(),
+            recv_timestamp: None,
             send_meta: crate::PacketSendMeta::default(),
         }
     }

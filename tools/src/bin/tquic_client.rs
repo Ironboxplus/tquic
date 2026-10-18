@@ -793,6 +793,8 @@ impl Worker {
                 src: remote,
                 dst: local,
                 time: Instant::now(),
+                recv_timestamp: None,
+                send_meta: tquic::PacketSendMeta::default(),
             };
 
             // Process the incoming packet.

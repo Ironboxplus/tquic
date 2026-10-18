@@ -265,6 +265,11 @@ pub struct PacketInfo {
     /// The time when the packet arrived or the time to send the packet
     pub time: time::Instant,
 
+    /// Optional application receive timestamp, captured before this packet
+    /// waits in a receive queue. The clock and epoch belong to the application;
+    /// TQUIC preserves it on DATAGRAM delivery without interpreting it.
+    pub recv_timestamp: Option<u64>,
+
     /// Semantics captured while the packet was composed, before encryption.
     /// Send backends must use this rather than attempting to inspect encrypted
     /// QUIC payloads to decide whether a packet may consume a data budget.

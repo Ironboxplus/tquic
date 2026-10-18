@@ -284,7 +284,7 @@ impl FlowPaths {
 pub(crate) struct DatagramState {
     /// Bytes received but not yet delivered to the application.
     recv_buffered: usize,
-    incoming: VecDeque<Bytes>,
+    incoming: VecDeque<(Bytes, Option<u64>)>,
     outgoing: VecDeque<OutgoingDatagram>,
     outgoing_total: usize,
 
@@ -365,7 +365,7 @@ impl DatagramState {
 
     /// Handle a received datagram. Return true if the receive queue was
     /// empty before.
-    pub(crate) fn received(&mut self, data: Bytes, window: Option<usize>) -> Result<bool> {
+    pub(crate) fn received(&mut self, data: Bytes, window: Option<usize>, timestamp: Option<u64>) -> Result<bool> {
         let window = match window {
             Some(window) => window,
             // Unexpected DATAGRAM frame.
@@ -383,7 +383,7 @@ impl DatagramState {
         }
 
         self.recv_buffered += data.len();
-        self.incoming.push_back(data);
+        self.incoming.push_back((data, timestamp));
         self.stats.received += 1;
         self.readable_pending = true;
         Ok(was_empty)
@@ -492,9 +492,13 @@ impl DatagramState {
     }
 
     pub(crate) fn recv(&mut self) -> Option<Bytes> {
-        let data = self.incoming.pop_front()?;
+        self.recv_with_timestamp().map(|(data, _)| data)
+    }
+
+    pub(crate) fn recv_with_timestamp(&mut self) -> Option<(Bytes, Option<u64>)> {
+        let (data, timestamp) = self.incoming.pop_front()?;
         self.recv_buffered -= data.len();
-        Some(data)
+        Some((data, timestamp))
     }
 
     pub(crate) fn has_outgoing(&self) -> bool {
@@ -567,21 +571,23 @@ mod tests {
     #[test]
     fn receive_window_drops_oldest_and_rejects_oversized() {
         let mut st = DatagramState::default();
-        assert!(st.received(bytes(40), Some(100)).unwrap());
-        assert!(!st.received(Bytes::from(vec![2u8; 40]), Some(100)).unwrap());
+        assert!(st.received(bytes(40), Some(100), Some(10)).unwrap());
+        assert!(!st.received(Bytes::from(vec![2u8; 40]), Some(100), Some(20)).unwrap());
         // A third 40-byte datagram evicts the oldest one.
-        st.received(Bytes::from(vec![3u8; 40]), Some(100)).unwrap();
+        st.received(Bytes::from(vec![3u8; 40]), Some(100), Some(30)).unwrap();
         assert_eq!(st.incoming_len(), 2);
         assert_eq!(st.stats.dropped_incoming, 1);
-        assert_eq!(st.recv().unwrap()[0], 2);
-        assert_eq!(st.recv().unwrap()[0], 3);
+        let (data, timestamp) = st.recv_with_timestamp().unwrap();
+        assert_eq!((data[0], timestamp), (2, Some(20)));
+        let (data, timestamp) = st.recv_with_timestamp().unwrap();
+        assert_eq!((data[0], timestamp), (3, Some(30)));
         assert!(st.recv().is_none());
 
         assert_eq!(
-            st.received(bytes(101), Some(100)),
+            st.received(bytes(101), Some(100), None),
             Err(Error::ProtocolViolation)
         );
-        assert_eq!(st.received(bytes(1), None), Err(Error::ProtocolViolation));
+        assert_eq!(st.received(bytes(1), None, None), Err(Error::ProtocolViolation));
     }
 
     #[test]

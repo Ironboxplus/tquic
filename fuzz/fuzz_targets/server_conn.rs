@@ -45,6 +45,8 @@ fuzz_target!(|data: &[u8]| {
         src: remote,
         dst: local,
         time: Instant::now(),
+        recv_timestamp: None,
+        send_meta: tquic::PacketSendMeta::default(),
     };
 
     let mut conn = tquic::Connection::new_server(

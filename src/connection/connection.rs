@@ -670,7 +670,7 @@ impl Connection {
                 qframes.push(frame.to_qlog());
             }
 
-            self.recv_frame(frame, &hdr, pid, space_id, info.time)?;
+            self.recv_frame(frame, &hdr, pid, space_id, info.time, info.recv_timestamp)?;
             let _ = payload.split_to(len);
         }
 
@@ -758,6 +758,7 @@ impl Connection {
         path_id: usize,
         space_id: SpaceId,
         now: time::Instant,
+        recv_timestamp: Option<u64>,
     ) -> Result<()> {
         debug!("{} recv frame {:?}", self.trace_id, &frame);
         match frame {
@@ -1004,7 +1005,7 @@ impl Connection {
                     return Err(Error::ProtocolViolation);
                 }
                 self.datagrams
-                    .received(data, Some(self.datagram_recv_buffer_size))?;
+                    .received(data, Some(self.datagram_recv_buffer_size), recv_timestamp)?;
             }
 
             Frame::NewToken { token } => {
@@ -1807,6 +1808,7 @@ impl Connection {
             src: path.local_addr(),
             dst: path.remote_addr(),
             time: time::Instant::now(),
+            recv_timestamp: None,
             send_meta,
         };
         Ok((done, info))
@@ -4956,6 +4958,13 @@ impl Connection {
         self.datagrams.recv()
     }
 
+    /// Receive a datagram and the application timestamp of its containing
+    /// packet. Delayed reads retain the original `PacketInfo::recv_timestamp`;
+    /// applications that do not supply one receive `None`.
+    pub fn dgram_recv_with_timestamp(&mut self) -> Option<(Bytes, Option<u64>)> {
+        self.datagrams.recv_with_timestamp()
+    }
+
     /// Return the largest datagram payload `dgram_send` currently accepts,
     /// or `None` if datagrams are disabled locally or not supported by the
     /// peer.
@@ -6147,6 +6156,7 @@ pub(crate) mod tests {
                 src: if is_server { server_addr } else { client_addr },
                 dst: if is_server { client_addr } else { server_addr },
                 time: time::Instant::now(),
+                recv_timestamp: None,
                 send_meta: PacketSendMeta::default(),
             }
         }
@@ -6462,6 +6472,7 @@ pub(crate) mod tests {
             src: initial_info.dst,
             dst: initial_info.src,
             time: initial_info.time,
+            recv_timestamp: None,
             send_meta: PacketSendMeta::default(),
         };
 
@@ -6511,6 +6522,7 @@ pub(crate) mod tests {
             src: info.dst,
             dst: info.src,
             time: info.time,
+            recv_timestamp: None,
             send_meta: PacketSendMeta::default(),
         };
 
@@ -10182,6 +10194,29 @@ pub(crate) mod tests {
         assert_eq!(stats.acked, 1);
         assert_eq!(stats.lost, 0);
         assert_eq!(test_pair.server.dgram_stats().received, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn dgram_receive_preserves_packet_timestamp_across_delayed_reads() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+        for timestamp in [Some(123), Some(456), None] {
+            test_pair.client.dgram_send(Bytes::from_static(b"probe"), false).unwrap();
+            let mut packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+            for (_, info) in &mut packets {
+                info.recv_timestamp = timestamp;
+            }
+            TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        }
+        // All three are already received. Reading them later must not replace
+        // timestamps, mix them between packets, or invent one for old callers.
+        for expected in [Some(123), Some(456), None] {
+            let (data, timestamp) = test_pair.server.dgram_recv_with_timestamp().unwrap();
+            assert_eq!(data, Bytes::from_static(b"probe"));
+            assert_eq!(timestamp, expected);
+        }
+        assert_eq!(test_pair.server.dgram_recv_queue_len(), 0);
+        assert_eq!(test_pair.server.dgram_recv_with_timestamp(), None);
         Ok(())
     }
 
