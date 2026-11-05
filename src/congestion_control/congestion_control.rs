@@ -348,5 +348,5 @@ mod cubic;
 mod delivery_rate;
 mod dummy;
 mod hystart_plus_plus;
-mod minmax;
+pub(crate) mod minmax;
 mod pacing;

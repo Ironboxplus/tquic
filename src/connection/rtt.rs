@@ -16,13 +16,18 @@ use std::cmp;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::congestion_control::minmax::MinMax;
 use crate::TIMER_GRANULARITY;
 
 /// How long a sample stays the path's propagation delay estimate
-/// (`windowed_min_rtt`): BBR's `MinRTTFilterLen`
-/// (draft-cardwell-iccrg-bbr-congestion-control, 10 s). The lifetime minimum
-/// of RFC 9002 Section 5.2 never forgets a route that is gone.
-pub const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
+/// (`windowed_min_rtt`). ET: Linux's `tcp_min_rtt_wlen` default (300 s,
+/// `net/ipv4/tcp_ipv4.c`), kept by the Nichols filter of `lib/win_minmax.c`
+/// (`tcp_update_rtt_min`). BBR's 10 s `MinRTTFilterLen` is not usable here: BBR
+/// drains the queue in ProbeRTT so that every window holds a low sample, a
+/// path selector has no such probe, and on a bufferbloated uplink the first
+/// sample after 10 s is a queued one. The lifetime minimum of RFC 9002
+/// Section 5.2 never forgets a route that is gone.
+pub const MIN_RTT_WINDOW: Duration = Duration::from_secs(300);
 
 /// RTT estimation for a network path
 /// See RFC 9001 Section 5
@@ -45,8 +50,12 @@ pub struct RttEstimator {
     /// The maximum RTT observed on the path, ignoring ack delay.
     max_rtt: Duration,
 
-    /// The smallest sample of the last `MIN_RTT_WINDOW` and when it was taken.
-    windowed_min_rtt: Option<(Duration, Instant)>,
+    /// The smallest sample of the last `MIN_RTT_WINDOW`, in microseconds
+    /// since `origin`; 0 until the first sample.
+    windowed_min_rtt: MinMax,
+
+    /// The filter's time zero.
+    origin: Instant,
 }
 
 /// An statistical description of the network path's RTT
@@ -58,7 +67,8 @@ impl RttEstimator {
             rttvar: initial_rtt / 2,
             min_rtt: initial_rtt,
             max_rtt: initial_rtt,
-            windowed_min_rtt: None,
+            windowed_min_rtt: MinMax::new(MIN_RTT_WINDOW.as_micros() as u64),
+            origin: Instant::now(),
         }
     }
 
@@ -81,8 +91,10 @@ impl RttEstimator {
     /// `MIN_RTT_WINDOW`, without the queueing that `smoothed_rtt` includes.
     /// The initial RTT until the first sample.
     pub fn windowed_min_rtt(&self) -> Duration {
-        self.windowed_min_rtt
-            .map_or(self.latest_rtt, |(rtt, _)| rtt)
+        match self.windowed_min_rtt.get() {
+            0 => self.latest_rtt,
+            micros => Duration::from_micros(micros),
+        }
     }
 
     /// Return the variation in the RTT samples using a mean variation.
@@ -127,14 +139,12 @@ impl RttEstimator {
     }
 
     fn update_at(&mut self, ack_delay: Duration, rtt: Duration, now: Instant) {
-        // As BBR's min_rtt filter: a sample replaces the estimate when it is
-        // no larger, or when the estimate has outlived the window.
-        let replace = self.windowed_min_rtt.map_or(true, |(min, at)| {
-            rtt <= min || now.saturating_duration_since(at) > MIN_RTT_WINDOW
-        });
-        if replace {
-            self.windowed_min_rtt = Some((rtt, now));
-        }
+        // `MinMax` reads 0 as "no sample"; Linux's `tcp_update_rtt_min` also
+        // lifts a zero sample to one tick.
+        self.windowed_min_rtt.update_min(
+            now.saturating_duration_since(self.origin).as_micros() as u64,
+            (rtt.as_micros() as u64).max(1),
+        );
 
         self.latest_rtt = rtt;
         self.min_rtt = cmp::min(self.min_rtt, self.latest_rtt);
@@ -259,5 +269,56 @@ mod tests {
         r.update_at(ms(0), ms(80), t0 + MIN_RTT_WINDOW + ms(1));
         assert_eq!(r.windowed_min_rtt(), ms(80));
         assert_eq!(r.min_rtt(), ms(20));
+    }
+
+    #[test]
+    fn windowed_min_rtt_keeps_the_propagation_delay_while_the_queue_builds() {
+        let ms = time::Duration::from_millis;
+        let mut r = RttEstimator::new(ms(333));
+        let t0 = Instant::now();
+
+        // An idle path measures its propagation delay.
+        for s in 0..=5 {
+            r.update_at(ms(0), ms(47), t0 + ms(s * 1_000));
+        }
+        // Then it carries load and the bufferbloated uplink queues every sample.
+        // Past 10 s a "replace once old" filter adopts the queued sample.
+        for s in 6..=20 {
+            r.update_at(ms(0), ms(150 + (s % 7) * 10), t0 + ms(s * 1_000));
+            assert_eq!(r.windowed_min_rtt(), ms(47), "at {s} s");
+        }
+    }
+
+    #[test]
+    fn windowed_min_rtt_follows_a_longer_route_after_the_window() {
+        let ms = time::Duration::from_millis;
+        let mut r = RttEstimator::new(ms(333));
+        let t0 = Instant::now();
+
+        r.update_at(ms(0), ms(47), t0);
+        // The route got longer: every sample is 117 ms. The 47 ms sample is
+        // forgotten only once it is older than the 300 s window.
+        let mut s = 1;
+        while ms(s * 1_000) <= MIN_RTT_WINDOW {
+            r.update_at(ms(0), ms(117), t0 + ms(s * 1_000));
+            assert_eq!(r.windowed_min_rtt(), ms(47), "at {s} s");
+            s += 15;
+        }
+        r.update_at(ms(0), ms(117), t0 + MIN_RTT_WINDOW + ms(1_000));
+        r.update_at(ms(0), ms(117), t0 + MIN_RTT_WINDOW + ms(2_000));
+        assert_eq!(r.windowed_min_rtt(), ms(117));
+        assert_eq!(r.min_rtt(), ms(47));
+    }
+
+    #[test]
+    fn windowed_min_rtt_survives_a_zero_sample() {
+        let ms = time::Duration::from_millis;
+        let mut r = RttEstimator::new(ms(333));
+        let t0 = Instant::now();
+        // `MinMax` treats 0 as "uninitialised" (Linux's `tcp_update_rtt_min`
+        // substitutes one tick for a zero sample).
+        r.update_at(ms(0), time::Duration::ZERO, t0);
+        r.update_at(ms(0), ms(30), t0 + ms(1));
+        assert!(r.windowed_min_rtt() < ms(1));
     }
 }

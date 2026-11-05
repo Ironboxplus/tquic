@@ -689,6 +689,20 @@ impl Config {
         self.recovery.max_pto = cmp::max(Duration::from_millis(millis), TIMER_GRANULARITY);
     }
 
+    /// Set the upper limit of how much the probe timeout may grow from one
+    /// consecutive timeout to the next, in milliseconds.
+    ///
+    /// By default (never set) the probe timeout doubles with every consecutive
+    /// timeout. With a limit it doubles only while that is shorter than the
+    /// previous timeout plus the limit, and grows linearly by the limit after
+    /// that (a link slower than `limit / 1.5` uses `1.5 * smoothed_rtt`
+    /// instead). The probes of a long outage then keep coming at a steady
+    /// pace, so the first one after the link returns is not far off. This is
+    /// the `MAX_PTO_INTERVAL` of noq (`noq-proto`, `pto_time_and_space`).
+    pub fn set_max_pto_interval(&mut self, millis: u64) {
+        self.recovery.max_pto_interval = Some(cmp::max(Duration::from_millis(millis), TIMER_GRANULARITY));
+    }
+
     /// Set the `active_connection_id_limit` transport parameter.
     /// The default value is `2`. Lower values will be ignored.
     pub fn set_active_connection_id_limit(&mut self, v: u64) {
@@ -977,6 +991,10 @@ pub struct RecoveryConfig {
     /// Upper limit of probe timeout.
     pub max_pto: Duration,
 
+    /// Upper limit of the growth of the probe timeout from one consecutive
+    /// timeout to the next, or `None` for plain exponential backoff.
+    pub max_pto_interval: Option<Duration>,
+
     /// Brutal's fixed target send rate, in bytes/sec (MP_SQM_PLAN.md S2.4).
     /// Unlike every other algorithm here, Brutal does not infer a rate from
     /// measurements -- the caller (an outside rate negotiation, or an MP
@@ -1016,6 +1034,7 @@ impl Default for RecoveryConfig {
             pacing_granularity: time::Duration::from_millis(1),
             pto_linear_factor: DEFAULT_PTO_LINEAR_FACTOR,
             max_pto: MAX_PTO,
+            max_pto_interval: None,
             brutal_bps: 0,
             brutal_disable_loss_compensation: false,
         }
@@ -1357,7 +1376,7 @@ pub struct PathStats {
     pub min_rtt: u64,
 
     /// The path's propagation delay in microseconds: the smallest roundtrip
-    /// time of the last 10 seconds (BBR's min_rtt filter). Unlike `min_rtt`
+    /// time of the last 300 seconds (Linux's windowed `tcp_min_rtt`). Unlike `min_rtt`
     /// it follows a route change, and unlike `srtt` it holds no queueing.
     pub windowed_min_rtt: u64,
 
@@ -1491,6 +1510,20 @@ mod tests {
     }
 
     #[test]
+    fn max_pto_interval() -> Result<()> {
+        let mut config = Config::new()?;
+        assert_eq!(config.recovery.max_pto_interval, None);
+
+        config.set_max_pto_interval(0);
+        assert_eq!(config.recovery.max_pto_interval, Some(TIMER_GRANULARITY));
+
+        config.set_max_pto_interval(2000);
+        assert_eq!(config.recovery.max_pto_interval, Some(Duration::from_millis(2000)));
+
+        Ok(())
+    }
+
+    #[test]
     fn initial_max_streams_bidi() -> Result<()> {
         let mut config = Config::new()?;
         config.set_initial_max_streams_bidi(u64::MAX);
@@ -1506,6 +1539,7 @@ mod tests {
 pub use crate::congestion_control::CongestionControlAlgorithm;
 pub use crate::connection::path::Path;
 pub use crate::connection::path::PathState;
+pub use crate::connection::path::PATH_BACKOFF_PTO_COUNT;
 pub use crate::connection::Connection;
 pub use crate::connection::DatagramStats;
 pub use crate::connection::SendDatagramError;

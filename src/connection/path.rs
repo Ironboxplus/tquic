@@ -45,7 +45,7 @@ pub(crate) const MAX_PROBING_TIMEOUTS: usize = 8;
 /// Probes, ACKs and keep-alives still use it, and any ACK ends the back-off.
 /// PTOs only drive recovery; whether the path is dead is decided by time
 /// (the host's idle timeout on `PathStats::idle_time`), as in noq.
-pub(crate) const PATH_BACKOFF_PTO_COUNT: usize = 3;
+pub const PATH_BACKOFF_PTO_COUNT: usize = 3;
 
 /// The kinds of active paths the multipath schedulers pass over, see
 /// `PathMap::held_back`.
