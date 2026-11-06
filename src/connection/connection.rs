@@ -1724,16 +1724,62 @@ impl Connection {
         // Process all lost frames and prepare for retransmitting
         self.process_all_lost_frames();
 
-        // Select a path for sending a packet
-        let pid = match self.select_send_path(sender) {
-            Ok(pid) => pid,
-            Err(Error::Done) => {
-                self.mark_paths_with_nothing_to_send(sender);
-                return Err(Error::Done);
+        // A path that writes nothing, say because its congestion window is
+        // full, must not end the round: the next path is tried, as noq's
+        // `poll_transmit` does. Otherwise a new path stuck in validation (a
+        // PMTU black hole drops its PATH_RESPONSEs) is selected first every
+        // time and stalls every other path between its PTOs (2026-11-06).
+        let mut tried = Vec::new();
+        let (pid, mut done, left, has_initial, send_meta) = loop {
+            // Select a path for sending a packet
+            let pid = match self.select_send_path_excluding(sender, &tried) {
+                Ok(pid) if !tried.contains(&pid) => pid,
+                Ok(_) | Err(Error::Done) => {
+                    self.mark_paths_with_nothing_to_send(sender);
+                    return Err(Error::Done);
+                }
+                Err(e) => return Err(e),
+            };
+            let (done, left, has_initial, send_meta) = self.send_packets_on(out, pid, sender)?;
+            if done > 0 {
+                break (pid, done, left, has_initial, send_meta);
             }
-            Err(e) => return Err(e),
+            tried.push(pid);
         };
 
+        // Sending UDP datagrams carrying Initial packets of this size ensures
+        // that the network path supports a reasonable Path Maximum Transmission
+        // Unit (PMTU), in both directions. Initial packets can even be coalesced
+        // with invalid packets, which a receiver will discard.
+        // See RFC 9000 Section 14.1
+        if has_initial && left > 0 && done < crate::MIN_CLIENT_INITIAL_LEN {
+            let pad_len = cmp::min(left, crate::MIN_CLIENT_INITIAL_LEN - done);
+            out[done..done + pad_len].fill(0);
+            done += pad_len;
+        }
+
+        let path = self.paths.get(pid)?;
+        let info = PacketInfo {
+            src: path.local_addr(),
+            dst: path.remote_addr(),
+            time: time::Instant::now(),
+            recv_timestamp: None,
+            send_meta,
+        };
+        Ok((done, info))
+    }
+
+    /// Write the QUIC packets of one UDP datagram for the path `pid` to `out`.
+    ///
+    /// Return the bytes written, the room left, whether an Initial packet was
+    /// written, and what the packets carry. Zero bytes means the path has
+    /// nothing it may send now.
+    fn send_packets_on(
+        &mut self,
+        out: &mut [u8],
+        pid: usize,
+        sender: &dyn PacketSendHandler,
+    ) -> Result<(usize, usize, bool, PacketSendMeta)> {
         // Limit bytes sent by path MTU limit and server send limit before address validation
         let mut left = cmp::min(out.len(), self.max_datagram_size(pid));
         left = self.paths.cmp_anti_ampl_limit(pid, left);
@@ -1787,31 +1833,7 @@ impl Connection {
             }
         }
 
-        if done == 0 {
-            self.mark_paths_with_nothing_to_send(sender);
-            return Err(Error::Done);
-        }
-
-        // Sending UDP datagrams carrying Initial packets of this size ensures
-        // that the network path supports a reasonable Path Maximum Transmission
-        // Unit (PMTU), in both directions. Initial packets can even be coalesced
-        // with invalid packets, which a receiver will discard.
-        // See RFC 9000 Section 14.1
-        if has_initial && left > 0 && done < crate::MIN_CLIENT_INITIAL_LEN {
-            let pad_len = cmp::min(left, crate::MIN_CLIENT_INITIAL_LEN - done);
-            out[done..done + pad_len].fill(0);
-            done += pad_len;
-        }
-
-        let path = self.paths.get(pid)?;
-        let info = PacketInfo {
-            src: path.local_addr(),
-            dst: path.remote_addr(),
-            time: time::Instant::now(),
-            recv_timestamp: None,
-            send_meta,
-        };
-        Ok((done, info))
+        Ok((done, left, has_initial, send_meta))
     }
 
     /// Write a QUIC packet to the given buffer.
@@ -3555,14 +3577,18 @@ impl Connection {
 
     /// A path that can send the oldest datagram of some flow now: under the
     /// bypass any path a flow is on, otherwise one whose congestion window,
-    /// pacer and data gate allow it.
-    fn select_datagram_path(&mut self, sender: &dyn PacketSendHandler) -> Option<usize> {
+    /// pacer and data gate allow it. The paths in `skip` are passed over.
+    fn select_datagram_path(
+        &mut self,
+        sender: &dyn PacketSendHandler,
+        skip: &[usize],
+    ) -> Option<usize> {
         if !self.is_established() || !self.datagrams.has_outgoing() {
             return None;
         }
         let bypass = self.datagrams.breaker.active();
         let flow_path = self.datagram_flow_paths(time::Instant::now());
-        let mut tried = Vec::new();
+        let mut tried = skip.to_vec();
         for i in 0..self.datagrams.outgoing_len() {
             let Some(pid) = self.datagrams.flow_at(i).and_then(|flow| flow_path.get(&flow)) else {
                 continue;
@@ -3585,12 +3611,24 @@ impl Connection {
         None
     }
 
+    #[cfg(test)]
     fn select_send_path(&mut self, sender: &dyn PacketSendHandler) -> Result<usize> {
+        self.select_send_path_excluding(sender, &[])
+    }
+
+    /// Select a path for the next packet, passing over the paths in `skip`:
+    /// those that already wrote nothing in this `send` call.
+    fn select_send_path_excluding(
+        &mut self,
+        sender: &dyn PacketSendHandler,
+        skip: &[usize],
+    ) -> Result<usize> {
         // Select an unvalidated path with path probing packets to send
         if self.is_established() {
             let mut probing = self
                 .paths
                 .iter_mut()
+                .filter(|(pid, _)| !skip.contains(pid))
                 .filter(|(_, p)| p.dcid_seq.is_some())
                 .filter(|(_, p)| p.need_send_validation_frames(self.is_server))
                 .map(|(pid, _)| pid);
@@ -3607,8 +3645,9 @@ impl Connection {
             let probing_backed_off = self
                 .paths
                 .iter()
-                .find(|(_, p)| {
-                    p.active()
+                .find(|(pid, p)| {
+                    !skip.contains(pid)
+                        && p.active()
                         && p.backed_off()
                         && self.spaces.get(p.space_id).is_some_and(|s| s.loss_probes > 0)
                 })
@@ -3618,7 +3657,7 @@ impl Connection {
             }
 
             // Datagrams go on the path their flow keeps (S-I5/I6).
-            if let Some(pid) = self.select_datagram_path(sender) {
+            if let Some(pid) = self.select_datagram_path(sender, skip) {
                 return Ok(pid);
             }
 
@@ -3630,7 +3669,9 @@ impl Connection {
                     None => return Err(Error::InternalError),
                 };
                 if let Ok(pid) = s.on_select(&mut self.paths, &mut self.spaces, &mut self.streams) {
-                    return Ok(pid);
+                    if !skip.contains(&pid) {
+                        return Ok(pid);
+                    }
                 }
             }
 
@@ -3638,6 +3679,9 @@ impl Connection {
             // address report to send.
             let observed_address_reporting = self.observed_address_reporting();
             for (pid, path) in self.paths.iter_mut() {
+                if skip.contains(&pid) {
+                    continue;
+                }
                 if !path.active() {
                     // An idle path still owes the peer ACKs for its space, and
                     // keep-alive PINGs keep its NAT mappings open.
@@ -10858,7 +10902,6 @@ pub(crate) mod tests {
         client.paths.get_mut(validated)?.need_send_ping = true;
         client.stream_write(0, TestPair::new_test_data(100), false)?;
 
-        assert_eq!(client.select_send_path(&NoopSender)?, validated);
         let mut out = vec![0; 1500];
         let (written, info) = client.send(&mut out, &NoopSender)?;
         assert!(written > 0);
