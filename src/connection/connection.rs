@@ -10819,6 +10819,52 @@ pub(crate) mod tests {
         assert_eq!(server.select_send_path(&NoopSender)?, blocked);
         Ok(())
     }
+
+    /// A new path whose validation cannot finish (small packets pass, the
+    /// 1200-byte PATH_RESPONSE does not: a PMTU black hole) keeps owing a
+    /// PATH_CHALLENGE while its window is full of unacknowledged ones. The
+    /// validated path beside it must still send: in the 2026-11-06 incident
+    /// it sent only when the new path's PTO fired, 1, 2, then 4 s apart.
+    #[test]
+    fn a_congestion_blocked_path_awaiting_validation_does_not_stall_other_paths() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_cid_len(crate::MAX_CID_LEN);
+        client_config.enable_multipath(true);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_cid_len(crate::MAX_CID_LEN);
+        server_config.enable_multipath(true);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+        test_pair.advertise_new_cids()?;
+        let second = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+
+        let client = &mut test_pair.client;
+        client.add_path(second, server_addr)?;
+        let pid_of = |conn: &Connection, new: bool| {
+            conn.paths
+                .iter()
+                .find(|(_, p)| (p.local_addr() == second) == new)
+                .map(|(pid, _)| pid)
+                .unwrap()
+        };
+        let (validated, blocked) = (pid_of(client, false), pid_of(client, true));
+        let validated_local = client.paths.get(validated)?.local_addr();
+        let blocked_path = client.paths.get_mut(blocked)?;
+        assert!(blocked_path.need_send_validation_frames(false));
+        blocked_path.recovery.bytes_in_flight = usize::MAX / 2;
+
+        // The validated path has data and a PING to send.
+        client.paths.get_mut(validated)?.need_send_ping = true;
+        client.stream_write(0, TestPair::new_test_data(100), false)?;
+
+        assert_eq!(client.select_send_path(&NoopSender)?, validated);
+        let mut out = vec![0; 1500];
+        let (written, info) = client.send(&mut out, &NoopSender)?;
+        assert!(written > 0);
+        assert_eq!(info.src, validated_local);
+        Ok(())
+    }
 }
 
 mod cid;
