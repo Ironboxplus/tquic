@@ -10296,6 +10296,51 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The data packet counts on a real connection: a lost DATAGRAM is a sent
+    /// and a lost data packet, while the packets that only acknowledge what the
+    /// peer sends are neither (RFC 9002 Section 2: not in flight). On
+    /// 2026-11-20 a path that carried only acknowledgments read as clean.
+    #[test]
+    fn data_packet_counts_take_a_lost_datagram_and_leave_out_pure_acks() -> Result<()> {
+        let mut test_pair = dgram_test_pair(65535, 65535)?;
+        let counts = |conn: &mut Connection| -> Result<(u64, u64, u64)> {
+            let stats = &conn.paths.get_active()?.recovery.stats;
+            Ok((stats.sent_count, stats.sent_data_count, stats.lost_data_count))
+        };
+
+        let (_, sent_before, lost_before) = counts(&mut test_pair.client)?;
+        test_pair
+            .client
+            .dgram_send(Bytes::from_static(b"lost"), false)
+            .unwrap();
+        let dropped = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(dropped.iter().any(|(_, info)| info.send_meta.contains_data));
+        for id in 0..4u64 {
+            let data = Bytes::from(format!("dgram {id}"));
+            test_pair.client.dgram_send(data, false).unwrap();
+            let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+            TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        }
+
+        // The server has nothing to send but acknowledgments.
+        let (acks_before, server_data_before, _) = counts(&mut test_pair.server)?;
+        let acks = TestPair::conn_packets_out(&mut test_pair.server)?;
+        assert!(acks.iter().all(|(_, info)| info.send_meta.contains_ack));
+        TestPair::conn_packets_in(&mut test_pair.client, acks)?;
+        let (acks_after, server_data_after, _) = counts(&mut test_pair.server)?;
+        assert!(acks_after > acks_before, "the server sent its acknowledgments");
+        assert_eq!(
+            server_data_after, server_data_before,
+            "packets of ACK frames only are not data packets"
+        );
+
+        let (_, sent, lost) = counts(&mut test_pair.client)?;
+        assert!(sent - sent_before >= 5, "each DATAGRAM packet is a data packet: {}", sent - sent_before);
+        assert_eq!(lost - lost_before, 1, "the dropped DATAGRAM is a lost data packet");
+        assert_eq!(test_pair.client.dgram_stats().lost, 1);
+        Ok(())
+    }
+
     #[test]
     fn dgram_size_limits() -> Result<()> {
         // The server accepts DATAGRAM frames of at most 100 bytes.

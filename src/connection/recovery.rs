@@ -1649,6 +1649,7 @@ struct RecoveryMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use crate::congestion_control::CongestionControlAlgorithm;
     use crate::connection::space::RateSamplePacketState;
     use crate::ranges::RangeSet;
@@ -2649,6 +2650,80 @@ mod tests {
         assert_eq!(ack(&mut recovery, &mut spaces, 5..8, now)?, (0, 0));
         assert_eq!(recovery.bytes_in_flight, 0);
         assert_eq!(recovery.stats.lost_count, 2);
+        Ok(())
+    }
+
+    /// `sent_data_count` and `lost_data_count` count RFC 9002's in-flight
+    /// packets (Section 2) other than PMTU probes: a lost packet of ACK frames
+    /// only and a lost PMTU probe are in neither, a lost DATAGRAM packet is in
+    /// both, and a loss acknowledged later stays counted, as in `lost_bytes`.
+    #[test]
+    fn data_packet_counts_leave_out_ack_only_packets_and_pmtu_probes() -> Result<()> {
+        let conf = new_test_recovery_config();
+        let mut recovery = Recovery::new(&conf);
+        let mut spaces = PacketNumSpaceMap::new();
+        let space_id = SpaceId::Data;
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+        };
+        let start = Instant::now();
+
+        let mut ack_only = new_test_sent_packet(0, 50, start);
+        ack_only.ack_eliciting = false;
+        ack_only.in_flight = false;
+        ack_only.has_data = false;
+        let mut pmtu_probe = new_test_sent_packet(1, 1400, start);
+        pmtu_probe.pmtu_probe = true;
+        pmtu_probe.has_data = false;
+        let mut datagram = new_test_sent_packet(2, 1000, start);
+        datagram.frames = vec![frame::Frame::Datagram {
+            data: Bytes::from_static(b"lost"),
+        }];
+        for pkt in [ack_only, pmtu_probe, datagram] {
+            recovery.on_packet_sent(pkt, space_id, &mut spaces, status, start);
+        }
+        for pkt_num in 3..6 {
+            let pkt = new_test_sent_packet(pkt_num, 1000, start);
+            recovery.on_packet_sent(pkt, space_id, &mut spaces, status, start);
+        }
+        assert_eq!(recovery.stats.sent_data_count, 4, "the DATAGRAM and the three after it");
+
+        // 3..6 arrive: 0, 1 and 2 are declared lost by the packet threshold.
+        let mut acked = RangeSet::default();
+        acked.insert(3..6);
+        let now = start + Duration::from_millis(100);
+        let (lost_pkts, lost_bytes) = recovery.on_ack_received(
+            &acked,
+            0,
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now,
+        )?;
+        assert_eq!((lost_pkts, lost_bytes), (3, 2400), "the probe and the DATAGRAM are in flight");
+        assert_eq!(recovery.stats.lost_count, 3);
+        assert_eq!(recovery.stats.lost_data_bytes, 1000);
+        assert_eq!(recovery.stats.lost_data_count, 1, "only the DATAGRAM is a lost data packet");
+
+        // The DATAGRAM had arrived after all: the loss stays counted.
+        let mut acked = RangeSet::default();
+        acked.insert(2..3);
+        recovery.on_ack_received(
+            &acked,
+            0,
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now + Duration::from_millis(1),
+        )?;
+        assert_eq!(recovery.stats.lost_data_count, 1);
+        assert_eq!(recovery.stats.sent_data_count, 4);
         Ok(())
     }
 
