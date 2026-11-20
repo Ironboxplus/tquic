@@ -1438,6 +1438,17 @@ pub struct PathStats {
     /// they exceed the path MTU, so their loss says nothing about the path.
     pub lost_data_bytes: u64,
 
+    /// Data packets sent: the in-flight packets (ack-eliciting or padded,
+    /// RFC 9002 Section 2) other than PMTU probes. A packet of ACK frames only
+    /// is not in flight and is not counted, so the share of these declared
+    /// lost (`lost_data_count`) is the path's loss whatever the peer sends on
+    /// it. XQUIC counts the same packets (`XQC_CAN_IN_FLIGHT`).
+    pub sent_data_count: u64,
+
+    /// Data packets (see `sent_data_count`) declared lost. Like `lost_bytes`,
+    /// a packet acknowledged after it was declared lost stays counted.
+    pub lost_data_count: u64,
+
     /// Time since a packet last arrived on the path, in microseconds.
     pub idle_time: u64,
 }

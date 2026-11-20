@@ -588,12 +588,17 @@ impl Recovery {
         let ack_eliciting = pkt.ack_eliciting;
         let pacing = pkt.pacing;
         let sent_size = pkt.sent_size;
+        let pmtu_probe = pkt.pmtu_probe;
 
         pkt.time_sent = now;
         let space = match spaces.get_mut(space_id) {
             Some(space) => space,
             None => return,
         };
+        // A data packet, see `PathStats::sent_data_count`.
+        if in_flight && !pmtu_probe {
+            self.stats.sent_data_count = self.stats.sent_data_count.saturating_add(1);
+        }
         if is_app_data(space_id) {
             self.loss_detection.on_app_data_sent(pkt.pkt_num);
         }
@@ -904,6 +909,7 @@ impl Recovery {
         let mut lost_packets = 0;
         let mut lost_bytes = 0;
         let mut lost_probe_bytes = 0;
+        let mut lost_data_packets = 0;
         let mut latest_lost_packet = None;
 
         let app_data = is_app_data(space.id);
@@ -942,6 +948,8 @@ impl Recovery {
                     lost_bytes += unacked.sent_size as u64;
                     if unacked.pmtu_probe {
                         lost_probe_bytes += unacked.sent_size as u64;
+                    } else {
+                        lost_data_packets += 1;
                     }
                     space.bytes_in_flight = space.bytes_in_flight.saturating_sub(unacked.sent_size);
                     self.bytes_in_flight = self.bytes_in_flight.saturating_sub(unacked.sent_size);
@@ -1008,6 +1016,7 @@ impl Recovery {
             .stats
             .lost_data_bytes
             .saturating_add(lost_bytes - lost_probe_bytes);
+        self.stats.lost_data_count = self.stats.lost_data_count.saturating_add(lost_data_packets);
         (lost_packets, lost_bytes)
     }
 
