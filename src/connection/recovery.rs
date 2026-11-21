@@ -2736,6 +2736,71 @@ mod tests {
         Ok(())
     }
 
+    /// A data packet declared lost and acknowledged after all is counted in
+    /// `spurious_lost_data_count`, so that `lost_data_count` less it is the
+    /// real loss. As in `data_packet_counts_leave_out_ack_only_packets_and_pmtu_probes`,
+    /// a packet of ACK frames only and a PMTU probe are not data packets.
+    #[test]
+    fn a_packet_acknowledged_after_it_was_declared_lost_counts_as_a_spurious_data_loss(
+    ) -> Result<()> {
+        let conf = new_test_recovery_config();
+        let mut recovery = Recovery::new(&conf);
+        let mut spaces = PacketNumSpaceMap::new();
+        let space_id = SpaceId::Data;
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+        };
+        let start = Instant::now();
+
+        let mut ack_only = new_test_sent_packet(0, 50, start);
+        ack_only.ack_eliciting = false;
+        ack_only.in_flight = false;
+        ack_only.has_data = false;
+        let mut pmtu_probe = new_test_sent_packet(1, 1400, start);
+        pmtu_probe.pmtu_probe = true;
+        pmtu_probe.has_data = false;
+        for pkt in [ack_only, pmtu_probe] {
+            recovery.on_packet_sent(pkt, space_id, &mut spaces, status, start);
+        }
+        for pkt_num in 2..6 {
+            let pkt = new_test_sent_packet(pkt_num, 1000, start);
+            recovery.on_packet_sent(pkt, space_id, &mut spaces, status, start);
+        }
+        let ack = |recovery: &mut Recovery,
+                   spaces: &mut PacketNumSpaceMap,
+                   range: Range<u64>,
+                   now: Instant|
+         -> Result<(u64, u64)> {
+            let mut acked = RangeSet::default();
+            acked.insert(range);
+            recovery.on_ack_received(
+                &acked,
+                0,
+                space_id,
+                spaces,
+                status,
+                #[cfg(feature = "qlog")]
+                None,
+                now,
+            )
+        };
+
+        // 3..6 arrive: 0, 1 and 2 are declared lost by the packet threshold.
+        let now = start + Duration::from_millis(10);
+        assert_eq!(ack(&mut recovery, &mut spaces, 3..6, now)?, (3, 2400));
+        assert_eq!(recovery.stats.lost_data_count, 1, "packet 2 only");
+        assert_eq!(recovery.stats.spurious_lost_data_count, 0);
+
+        // They had arrived: only the data packet is a spurious data loss.
+        let now = start + Duration::from_millis(11);
+        assert_eq!(ack(&mut recovery, &mut spaces, 0..3, now)?, (0, 0));
+        assert_eq!(recovery.stats.spurious_lost_data_count, 1);
+        assert_eq!(recovery.stats.lost_data_count, 1, "the loss itself stays counted");
+        Ok(())
+    }
+
     #[test]
     fn calculate_pto() -> Result<()> {
         assert_eq!(
