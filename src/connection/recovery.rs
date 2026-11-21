@@ -750,7 +750,12 @@ impl Recovery {
         );
 
         // Remove acked or lost packets from sent queue in batch.
-        self.drain_sent_packets(space, now, self.rtt.smoothed_rtt());
+        let lost_retention = if is_app_data(space_id) {
+            self.spurious_loss_retention()
+        } else {
+            self.rtt.smoothed_rtt()
+        };
+        self.drain_sent_packets(space, now, lost_retention);
 
         // Notify the congestion controller of acked event
         if space_id != SpaceId::Initial && space_id != SpaceId::Handshake {
@@ -1025,11 +1030,35 @@ impl Recovery {
         (lost_packets, lost_bytes)
     }
 
-    // Remove acked or lost packet from the packet sent queue in batch.
+    /// How long the record of a lost application data packet is kept, to
+    /// recognise its acknowledgment if it arrives late: three probe timeouts,
+    /// as quic-go keeps it (`lostPackets.DeleteBefore(rcvTime - 3*PTO)`).
+    /// One smoothed RTT is shorter than the lateness seen on a LAN path
+    /// (1 ms against 6 ms on 2026-11-21). Without backoff: the records are
+    /// only packet headers, and a path that went silent must not keep them
+    /// for the length of its backed off timeout.
+    fn spurious_loss_retention(&self) -> Duration {
+        let pto_base = self.rtt.pto_base();
+        3 * self.loss_detection.pto_with_ack_delay(
+            pto_base,
+            pto_base,
+            self.max_ack_delay,
+            0,
+            self.rtt.smoothed_rtt(),
+        )
+    }
+
+    // Remove acked or lost packet from the packet sent queue in batch. A lost
+    // packet is kept for `lost_retention` after it was declared lost.
     //
     // Removing packets from the middle would require copying to compact the vec.
     // So it only remove a contiguous range of packets from the start of the vec.
-    fn drain_sent_packets(&mut self, space: &mut PacketNumSpace, now: Instant, rtt: Duration) {
+    fn drain_sent_packets(
+        &mut self,
+        space: &mut PacketNumSpace,
+        now: Instant,
+        lost_retention: Duration,
+    ) {
         let mut lowest_non_expired_pkt_index = space.sent.len();
         for (i, pkt) in space.sent.iter().enumerate() {
             // find the first element that is neither acked nor lost.
@@ -1038,7 +1067,7 @@ impl Recovery {
                 break;
             }
             if let Some(time_lost) = pkt.time_lost {
-                if time_lost + rtt > now {
+                if time_lost + lost_retention > now {
                     lowest_non_expired_pkt_index = i;
                     break;
                 }
