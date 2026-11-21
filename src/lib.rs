@@ -1446,8 +1446,17 @@ pub struct PathStats {
     pub sent_data_count: u64,
 
     /// Data packets (see `sent_data_count`) declared lost. Like `lost_bytes`,
-    /// a packet acknowledged after it was declared lost stays counted.
+    /// a packet acknowledged after it was declared lost stays counted: see
+    /// `spurious_lost_data_count` for the real loss.
     pub lost_data_count: u64,
+
+    /// Data packets (see `sent_data_count`) declared lost and acknowledged
+    /// after all, counted when the acknowledgment arrives. `lost_data_count`
+    /// less this is the packets really lost. quic-go takes them back out of
+    /// its lost-packet statistic (`detectSpuriousLosses`), picoquic counts
+    /// them per path (`nb_spurious`) and XQUIC counts them apart
+    /// (`ctl_spurious_loss_count`).
+    pub spurious_lost_data_count: u64,
 
     /// Time since a packet last arrived on the path, in microseconds.
     pub idle_time: u64,

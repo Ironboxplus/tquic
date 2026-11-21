@@ -800,6 +800,11 @@ impl Recovery {
                     // when it was declared lost; only loss detection learns
                     // from it.
                     spuriously_lost.push((sent_pkt.pkt_num, sent_pkt.time_sent));
+                    // Counted as `lost_data_count` counts the loss.
+                    if sent_pkt.in_flight && !sent_pkt.pmtu_probe {
+                        self.stats.spurious_lost_data_count =
+                            self.stats.spurious_lost_data_count.saturating_add(1);
+                    }
                     idx += 1;
                     continue 'sent_pkt_loop;
                 }
