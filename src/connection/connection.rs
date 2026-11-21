@@ -2187,14 +2187,14 @@ impl Connection {
             if pkt_type == PacketType::OneRTT && self.datagrams.has_outgoing() {
                 if self.datagrams.breaker.active() {
                     return self.try_write_datagrams_bypassing_cwnd(
-                        buf, left, st, pkt_type, path_id, false,
+                        buf, left, st, pkt_type, path_id, false, sender,
                     );
                 }
                 // A tripped breaker or a closed window holds the bulk, not
                 // the measurements of the path (`OutgoingDatagram::measurement`).
                 if self.datagrams.has_measurement() {
                     return self.try_write_datagrams_bypassing_cwnd(
-                        buf, left, st, pkt_type, path_id, true,
+                        buf, left, st, pkt_type, path_id, true, sender,
                     );
                 }
             }
@@ -2263,13 +2263,15 @@ impl Connection {
         // -- see PacketSendHandler::can_send_data.
         let mut data_gate_open = !held_back && self.data_gate_open(sender, pkt_type, path_id)?;
 
-        // Write DATAGRAM frames. Under the bypass they go to the sender's
-        // queue whatever the data gate says: that queue is where they wait
-        // and are dropped (the WireGuard model, MP_FIX_PHASES.md S-I1), and
-        // the gate is for congestion-controlled data (S-I12). Otherwise they
-        // share the data gate, the congestion window and the pacer with
-        // STREAM frames.
-        if !held_back && (data_gate_open || self.datagrams.breaker.active()) {
+        // Write DATAGRAM frames. They share the data gate with STREAM frames,
+        // and the congestion window and the pacer unless the bypass is on.
+        // Behind a closed gate they wait in the application's queue before
+        // QUIC (EasyTier's `pre_quic_cake`), not in one below it: the packets
+        // below QUIC are numbered already, and a queue that lets another
+        // flow's packet overtake them has the peer's acknowledgments declare
+        // the overtaken packets lost (RFC 9002 Section 6.1.1). Only
+        // measurements go past a closed gate.
+        if data_gate_open {
             self.try_write_datagram_frames(out, st, pkt_type, path_id, false)?;
         } else if !held_back && self.datagrams.has_measurement() {
             self.try_write_datagram_frames(out, st, pkt_type, path_id, true)?;
@@ -2371,10 +2373,12 @@ impl Connection {
     }
 
     /// Write a packet of DATAGRAM frames while the congestion window or the
-    /// pacer holds the path (RFC 9484 Section 10.2). Datagrams wait and are
-    /// dropped in the sender's queue below QUIC, as WireGuard's packets wait
-    /// in the NIC's qdisc, not here (MP_FIX_PHASES.md S-I1); a path the
-    /// schedulers hold back still carries none.
+    /// pacer holds the path (RFC 9484 Section 10.2). The data gate still
+    /// holds the application datagrams: they wait in the application's queue
+    /// before QUIC, not in one below it, whose reordering of numbered packets
+    /// the peer's acknowledgments turn into losses (RFC 9002 Section 6.1.1);
+    /// a path the schedulers hold back still carries none.
+    #[allow(clippy::too_many_arguments)]
     fn try_write_datagrams_bypassing_cwnd(
         &mut self,
         buf: &mut [u8],
@@ -2383,10 +2387,12 @@ impl Connection {
         pkt_type: PacketType,
         path_id: usize,
         only_measurement: bool,
+        sender: &dyn PacketSendHandler,
     ) -> Result<()> {
         if self.paths.held_back().applies(self.paths.get(path_id)?) {
             return Err(Error::Done);
         }
+        let only_measurement = only_measurement || !self.data_gate_open(sender, pkt_type, path_id)?;
         // Counted against the pacer, so the path's congestion-controlled
         // data waits for the share the datagrams took.
         st.pacing = true;
@@ -3575,9 +3581,10 @@ impl Connection {
         placed
     }
 
-    /// A path that can send the oldest datagram of some flow now: under the
-    /// bypass any path a flow is on, otherwise one whose congestion window,
-    /// pacer and data gate allow it. The paths in `skip` are passed over.
+    /// A path that can send the oldest datagram of some flow now: one whose
+    /// data gate allows it and, unless the bypass is on, whose congestion
+    /// window does too; a measurement needs neither. The paths in `skip` are
+    /// passed over.
     fn select_datagram_path(
         &mut self,
         sender: &dyn PacketSendHandler,
@@ -3597,14 +3604,17 @@ impl Connection {
                 continue;
             }
             tried.push(*pid);
-            if bypass || self.datagrams.is_measurement_at(i) {
+            if self.datagrams.is_measurement_at(i) {
                 return Some(*pid);
+            }
+            if !self.data_gate_open(sender, PacketType::OneRTT, *pid).unwrap_or(false) {
+                continue;
             }
             let can_send = self
                 .paths
                 .get_mut(*pid)
                 .is_ok_and(|p| p.recovery.can_send());
-            if can_send && self.data_gate_open(sender, PacketType::OneRTT, *pid).unwrap_or(false) {
+            if bypass || can_send {
                 return Some(*pid);
             }
         }
