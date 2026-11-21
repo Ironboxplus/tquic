@@ -2278,9 +2278,11 @@ impl Connection {
         }
 
         // A packet holding datagrams of an application flow carries nothing
-        // else, so that its flow is the packet's: a send queue below QUIC
-        // (`PacketSendMeta::flow_hash`) isolates flows by packet. The STREAM
-        // data waits for the next packet.
+        // else, so that its flow is the packet's (`PacketSendMeta::flow_hash`):
+        // a flow stays on one path, and EasyTier marks the packet of a delay
+        // probe by its flow. (A queue below QUIC no longer isolates flows by
+        // it: that reordered numbered packets.) The STREAM data waits for the
+        // next packet.
         if matches!(st.datagram_flow, Some(Some(_))) {
             data_gate_open = false;
         }
