@@ -2806,6 +2806,70 @@ mod tests {
         Ok(())
     }
 
+    /// A packet declared lost is kept for three probe timeouts, as quic-go
+    /// keeps it, so that its late acknowledgment is recognised. On a LAN path
+    /// whose smoothed RTT is 1 ms the 6 ms by which an acknowledgment was late
+    /// on 2026-11-21 is longer than one smoothed RTT: the record was gone and
+    /// the loss stayed a loss.
+    #[test]
+    fn a_late_acknowledgment_within_three_ptos_is_recognised_as_spurious() -> Result<()> {
+        let conf = RecoveryConfig {
+            initial_rtt: Duration::from_millis(1),
+            max_ack_delay: Duration::from_millis(25),
+            ..new_test_recovery_config()
+        };
+        let mut recovery = Recovery::new(&conf);
+        let mut spaces = PacketNumSpaceMap::new();
+        let space_id = SpaceId::Data;
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+        };
+        let start = Instant::now();
+        let ack = |recovery: &mut Recovery,
+                   spaces: &mut PacketNumSpaceMap,
+                   range: Range<u64>,
+                   now: Instant|
+         -> Result<(u64, u64)> {
+            let mut acked = RangeSet::default();
+            acked.insert(range);
+            recovery.on_ack_received(
+                &acked,
+                0,
+                space_id,
+                spaces,
+                status,
+                #[cfg(feature = "qlog")]
+                None,
+                now,
+            )
+        };
+
+        for pkt_num in 0..7 {
+            let pkt = new_test_sent_packet(pkt_num, 1000, start);
+            recovery.on_packet_sent(pkt, space_id, &mut spaces, status, start);
+        }
+        // 3..6 overtook 0..3: they are declared lost by the packet threshold.
+        let now = start + Duration::from_millis(1);
+        assert_eq!(ack(&mut recovery, &mut spaces, 3..6, now)?, (3, 3000));
+        // The acknowledgment of the last packet is what drains the records,
+        // longer than one smoothed RTT after the loss.
+        let now = start + Duration::from_millis(3);
+        assert_eq!(ack(&mut recovery, &mut spaces, 6..7, now)?, (0, 0));
+
+        // The first three arrived after all, 3 ms after they were declared lost.
+        let now = start + Duration::from_millis(4);
+        assert_eq!(ack(&mut recovery, &mut spaces, 0..3, now)?, (0, 0));
+        assert!(
+            !recovery.loss_detection.lost_by_reordering(0, 100, true),
+            "the spurious loss ended the packet threshold"
+        );
+        assert_eq!(recovery.stats.spurious_lost_data_count, 3);
+        assert_eq!(recovery.stats.lost_data_count, 3);
+        Ok(())
+    }
+
     #[test]
     fn calculate_pto() -> Result<()> {
         assert_eq!(
