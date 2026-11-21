@@ -2084,6 +2084,55 @@ mod tests {
         Ok(())
     }
 
+    /// The mechanism behind the `oversize_dropped` jumps of 2026-11-21 (not a
+    /// failing test: the detector is quinn's and stays as it is). Small
+    /// packets that overtake large ones are acknowledged first, and the large
+    /// ones between them are declared lost by the packet threshold in the
+    /// same acknowledgment: each is a loss burst of its own with no smaller
+    /// packet in it and no larger one delivered after it, so the detector
+    /// reads a path whose MTU shrank and the connection's datagram limit
+    /// falls back to 1200. A queue below QUIC must therefore never reorder
+    /// numbered packets.
+    #[test]
+    fn reordered_small_packets_trip_the_pmtu_black_hole_heuristic() -> Result<()> {
+        let conf = new_test_recovery_config();
+        let mut recovery = Recovery::new(&conf);
+        let mut spaces = PacketNumSpaceMap::new();
+        let space_id = SpaceId::Data;
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+        };
+        let mut now = Instant::now();
+        // 1300 byte packets (above the 1200 byte minimum) alternate with 200
+        // byte ones.
+        for pkt_num in 0..12 {
+            let size = if pkt_num % 2 == 0 { 1300 } else { 200 };
+            let pkt = new_test_sent_packet(pkt_num, size, now);
+            recovery.on_packet_sent(pkt, space_id, &mut spaces, status, now);
+        }
+
+        now += Duration::from_millis(1);
+        let mut acked = RangeSet::default();
+        for pkt_num in (1..12).step_by(2) {
+            acked.insert(pkt_num..pkt_num + 1);
+        }
+        let (lost_pkts, _) = recovery.on_ack_received(
+            &acked,
+            0,
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now,
+        )?;
+        assert_eq!(lost_pkts, 5, "the large packets 0, 2, 4, 6 and 8 are overtaken by 3 or more");
+        assert!(recovery.take_pmtu_black_hole());
+        Ok(())
+    }
+
     #[test]
     fn loss_on_reordering() -> Result<()> {
         let conf = new_test_recovery_config();
