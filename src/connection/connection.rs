@@ -10710,11 +10710,15 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// S-I1/S-I12: under the bypass, datagrams leave whatever the data gate
-    /// says (the sender's queue below QUIC is where they wait), while stream
-    /// data still waits for the gate.
+    /// S-I12, corrected on 2026-11-21: the bypass skips the congestion window
+    /// and the pacer, but application datagrams still wait for the data gate,
+    /// in the application's queue before QUIC. A queue below QUIC holds
+    /// packets that are numbered already, and one that lets another flow's
+    /// packet overtake them has the peer's acknowledgments declare the
+    /// overtaken packets lost (RFC 9002 Section 6.1.1). Measurement datagrams
+    /// are not held by the gate.
     #[test]
-    fn bypassed_datagrams_do_not_wait_for_the_data_gate() -> Result<()> {
+    fn under_the_bypass_application_datagrams_wait_for_the_data_gate() -> Result<()> {
         let mut client_config = TestPair::new_test_config(false)?;
         client_config.set_max_datagram_frame_size(65535);
         client_config.enable_datagram_bypass_cwnd(true);
@@ -10727,12 +10731,23 @@ pub(crate) mod tests {
         test_pair.client.stream_write(0, Bytes::from(vec![9u8; 30]), false)?;
         test_pair
             .client
-            .dgram_send(Bytes::from_static(b"not gated"), false)
+            .dgram_send(Bytes::from_static(b"gated"), false)
+            .unwrap();
+        test_pair
+            .client
+            .dgram_send_measurement(Bytes::from_static(b"probe"), false, None)
             .unwrap();
         let mut buf = vec![0; 1500];
         while test_pair.client.send(&mut buf, &GateSender::closed()).is_ok() {}
-        assert_eq!(test_pair.client.dgram_send_queue_len(), 0);
+        assert_eq!(
+            test_pair.client.dgram_send_queue_len(),
+            1,
+            "the measurement left, the application datagram waits"
+        );
         assert_eq!(test_pair.client.stream_unsent_bytes(0), Some(30));
+
+        while test_pair.client.send(&mut buf, &GateSender::open()).is_ok() {}
+        assert_eq!(test_pair.client.dgram_send_queue_len(), 0);
         Ok(())
     }
 
